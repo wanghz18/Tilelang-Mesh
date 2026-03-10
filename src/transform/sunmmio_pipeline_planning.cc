@@ -1,3 +1,6 @@
+#include "../op/builtin.h"
+#include "../op/utils.h"
+#include "common/ast_traverser.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
 #include "tvm/runtime/logging.h"
@@ -5,6 +8,10 @@
 #include "tvm/tir/expr.h"
 #include "tvm/tir/function.h"
 #include "tvm/tir/stmt.h"
+#include <algorithm>
+#include <iostream>
+#include <string>
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -14,14 +21,6 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
-#include "../op/region.h"
-#include "../op/builtin.h"
-#include "../op/utils.h"
-#include <algorithm>
-#include <iostream>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace tvm {
@@ -44,289 +43,6 @@ bool RegionIntersect(const Region &region1, const Region &region2) {
   }
   return true;
 }
-
-class BufferAccessCollector : public ExprVisitor {
-public:
-  BufferAccessCollector(Map<Var, Buffer> buffer_data_to_buffer)
-      : buffer_data_to_buffer_(buffer_data_to_buffer) {}
-
-  Array<BufferRegion> GetReads() const { return reads_; }
-  Array<BufferRegion> GetWrites() const { return writes_; }
-
-private:
-  void VisitExpr_(const BufferLoadNode *op) final {
-    auto load_buffer = op->buffer;
-    Array<PrimExpr> indices = op->indices;
-    // convert indices to region
-    Array<Range> region;
-    for (const auto &index : indices) {
-      region.push_back(Range::FromMinExtent(index, 1));
-    }
-    auto load_region = BufferRegion(load_buffer, region);
-    reads_.push_back(load_region);
-  }
-
-  void VisitExpr_(const CallNode *op) final {
-    auto args = op->args;
-    if (op->op.same_as(builtin::address_of())) {
-      BufferRegion buffer_region;
-      if (const auto *load = op->args[0].as<BufferLoadNode>()) {
-        buffer_region = BufferRegion::FullRegion(load->buffer);
-      } else if (const auto *var_node = op->args[0].as<VarNode>()) {
-        Var data_var = tvm::ffi::GetRef<Var>(var_node);
-        auto it = buffer_data_to_buffer_.find(data_var);
-        if (it != buffer_data_to_buffer_.end()) {
-          buffer_region = BufferRegion::FullRegion((*it).second);
-        }
-      }
-      if (buffer_region.defined()) {
-        reads_.push_back(buffer_region);
-      }
-    }
-    else if (op->op.same_as(builtin::tvm_access_ptr())) {
-      const VarNode *buffer_var = op->args[1].as<VarNode>();
-      ICHECK(buffer_var);
-      auto it =
-      buffer_data_to_buffer_.find(tvm::ffi::GetRef<Var>(buffer_var)); if (it
-      != buffer_data_to_buffer_.end()) {
-        const Buffer &buffer = (*it).second;
-        const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
-        reads_.push_back(buffer_region);
-      }
-    }
-    // else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    //   ICHECK(args[0].as<BufferLoadNode>());
-    //   Buffer mbar_buf = args[0].as<BufferLoadNode>()->buffer;
-    //   auto buffer_reads =
-    //       chain_builder_.mbar_to_buffer_reads_.find(mbar_buf.get());
-    //   auto buffer_writes =
-    //       chain_builder_.mbar_to_buffer_writes_.find(mbar_buf.get());
-    //   if (buffer_reads != chain_builder_.mbar_to_buffer_reads_.end()) {
-    //     reads_.insert(reads_.end(), buffer_reads->second.begin(),
-    //                   buffer_reads->second.end());
-    //   }
-    //   if (buffer_writes != chain_builder_.mbar_to_buffer_writes_.end()) {
-    //     writes_.insert(
-    //         writes_.end(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).begin(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).end());
-    //   }
-    // }
-
-    else {
-      ExprVisitor::VisitExpr_(op);
-    }
-  }
-
-private:
-  Array<BufferRegion> reads_;
-  Array<BufferRegion> writes_;
-  Map<Var, Buffer> buffer_data_to_buffer_;
-};
-
-class ASTTraverser: public StmtVisitor {
-public:
-  ASTTraverser(const PrimFunc &f) {
-    for (const auto &[_, buffer] : f->buffer_map) {
-      this->buffer_data_to_buffer_.Set(buffer->data, buffer);
-    }
-  }
-
-  std::pair<Array<BufferRegion>, Array<BufferRegion>> buffer_region_collector(const PrimExpr &expr) {
-    auto buf_load_collector = BufferAccessCollector(buffer_data_to_buffer_);
-    buf_load_collector(expr);
-    Array<BufferRegion> read_regions = buf_load_collector.GetReads();
-    Array<BufferRegion> write_regions = buf_load_collector.GetWrites();
-    return {read_regions, write_regions};
-  }
-
-  void VisitStmt_(const AttrStmtNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->value);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const LetStmtNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->value);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const ForNode *op) {
-    auto [min_read_regions, min_write_regions] =
-        buffer_region_collector(op->min);
-    for (auto it : min_read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : min_write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-
-    auto [extent_read_regions, extent_write_regions] =
-        buffer_region_collector(op->extent);
-    for (auto it : extent_read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : extent_write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const WhileNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->condition);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const AllocateNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->condition);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BufferRealizeNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->condition);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const AssertStmtNode *op) {
-    auto [condition_read_regions, condition_write_regions] =
-        buffer_region_collector(op->condition);
-    for (auto it : condition_read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : condition_write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-
-    auto [message_read_regions, message_write_regions] =
-        buffer_region_collector(op->message);
-    for (auto it : message_read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : message_write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BlockRealizeNode *op) {
-    auto [read_regions, write_regions] = buffer_region_collector(op->predicate);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BufferStoreNode *op) {
-    // For a buffer store statement, we need to check the dependencies for the
-    // buffer to be stored. For example, in the statement A[i] = B[j] + C[k], we
-    // need to check the dependencies for the buffer A.
-    Buffer store_buffer = op->buffer;
-    Array<PrimExpr> indices = op->indices;
-    // convert indices to region
-    Array<Range> region;
-    for (const auto &index : indices) {
-      region.push_back(Range::FromMinExtent(index, 1));
-    }
-    auto store_region = BufferRegion(store_buffer, region);
-    write_buffer_regions_.insert(store_region);
-
-    // For a store statement, we also need to check the read dependencies for
-    // the value to be stored. For example, in the statement A[i] = B[j] + C[k],
-    // we need to check the read dependencies for the buffers B and C.
-    auto [read_regions, write_regions] = buffer_region_collector(op->value);
-    for (auto it : read_regions) {
-      read_buffer_regions_.insert(it);
-    }
-    for (auto it : write_regions) {
-      write_buffer_regions_.insert(it);
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const EvaluateNode *op) {
-    const CallNode *call = op->value.as<CallNode>();
-    if (call->op.same_as(dma_copy())) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call->op.same_as(mma_sunmmio())) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-    // } else if (call->op.same_as(broadcast_())) {
-    //   read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-    //   write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else {
-      auto [read_regions, write_regions] = buffer_region_collector(op->value);
-      for (auto it : read_regions) {
-        read_buffer_regions_.insert(it);
-      }
-      for (auto it : write_regions) {
-        write_buffer_regions_.insert(it);
-      }
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BlockNode *op) final {
-    for (const auto &buffer : op->alloc_buffers) {
-      buffer_data_to_buffer_.Set(buffer->data, buffer);
-    }
-    StmtVisitor::VisitStmt_(op);
-    for (const auto &buffer : op->alloc_buffers) {
-      buffer_data_to_buffer_.erase(buffer->data);
-    }
-  }
-
-  void clear() {
-    read_buffer_regions_.clear();
-    write_buffer_regions_.clear();
-  }
-
-  void traverse_stmt(Stmt stmt) {
-    clear();
-    VisitStmt(stmt);
-  }
-
-public:
-  Map<Var, Buffer> buffer_data_to_buffer_;
-  
-  std::set<BufferRegion> read_buffer_regions_;
-  std::set<BufferRegion> write_buffer_regions_;
-};
 
 enum class DeviceType {
   ODMA,
@@ -402,27 +118,27 @@ public:
       Buffer incoming_buffer = incoming_buffer_region->buffer;
       Region incoming_region = incoming_buffer_region->region;
       // read after write
-      for (auto &read_buffer_region :reads) {
+      for (auto &read_buffer_region : reads) {
         Buffer read_buffer = read_buffer_region->buffer;
         Region read_region = read_buffer_region->region;
         if (incoming_buffer.same_as(read_buffer) &&
             RegionIntersect(incoming_region, read_region)) {
           return true;
-        } 
+        }
       }
 
       // write after write
-      for (auto &write_buffer_region :writes) {
+      for (auto &write_buffer_region : writes) {
         Buffer write_buffer = write_buffer_region->buffer;
         Region write_region = write_buffer_region->region;
         if (incoming_buffer.same_as(write_buffer) &&
             RegionIntersect(incoming_region, write_region)) {
           return true;
-        } 
+        }
       }
     }
-    
-    return false; 
+
+    return false;
   }
 
   std::vector<Command>
@@ -443,18 +159,16 @@ public:
                                 std::set<BufferRegion> &write_buffer_regions_) {
     for (auto &it : read_buffer_regions_) {
       reads.push_back(it);
-      LOG(INFO) << name << " read " << it->buffer->name << " " << it->region;
+      // LOG(INFO) << name << " read " << it->buffer->name << " " << it->region;
     }
     for (auto &it : write_buffer_regions_) {
       writes.push_back(it);
-      LOG(INFO) << name << " write " << it->buffer->name << " " << it->region;
+      // LOG(INFO) << name << " write " << it->buffer->name << " " <<
+      // it->region;
     }
   }
 
-  void set_finished(bool finished) {
-    this->finished = finished;
-  }
-
+  void set_finished(bool finished) { this->finished = finished; }
 };
 
 class Device {
@@ -485,7 +199,6 @@ public:
     }
   }
 };
-
 
 class Scheduler {
 public:
@@ -536,9 +249,7 @@ public:
     return path;
   }
 
-  int num_stages_to_iterations(int num_stages) {
-    return num_stages;
-  }
+  int num_stages_to_iterations(int num_stages) { return num_stages; }
 
   std::vector<Command> CriticalPathPipeline() {
 
@@ -563,7 +274,6 @@ public:
           for (auto &device : devices) {
             if (device.type == command->type && !device.busy) {
               device.assign_command(command, time);
-              LOG(INFO) << command->name << " scheduled at time " << time;
               schedule.push_back(*command);
               break;
             }
@@ -573,8 +283,7 @@ public:
 
       float pass_time = std::numeric_limits<float>::max();
       for (auto &device : devices) {
-        pass_time = std::min(pass_time,
-                             device.command_end_time - time);
+        pass_time = std::min(pass_time, device.command_end_time - time);
       }
       time += pass_time;
 
@@ -582,12 +291,10 @@ public:
       for (auto &device : devices)
         device.pass_time(time);
 
-      command_queue.erase(std::remove_if(command_queue.begin(),
-                                         command_queue.end(),
-                                         [](Command *cmd) {
-                                           return cmd->finished;
-                                         }),
-                          command_queue.end());
+      command_queue.erase(
+          std::remove_if(command_queue.begin(), command_queue.end(),
+                         [](Command *cmd) { return cmd->finished; }),
+          command_queue.end());
     }
     return schedule;
   }
@@ -657,10 +364,9 @@ private:
 
     Scheduler scheduler;
     int iterations = scheduler.num_stages_to_iterations(num_stages);
-    // LOG(INFO) << loop->loop_var<< loop->min<< loop->extent<< loop->kind<< loop->body<<
-    //            loop->thread_binding<< loop->annotations;
-    
-    // 1. Build Commands and Dependencies
+    std::set<Buffer> used_buffers;
+
+    // 1.1 Build For loop Commands and Dependencies
     for (int i = 0; i < iterations; i++) {
       for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
         auto stmt = pipeline_body_seq->seq[j];
@@ -668,7 +374,19 @@ private:
         traverser.traverse_stmt(stmt);
         cmd.get_command_reads_writes(traverser.read_buffer_regions_,
                                      traverser.write_buffer_regions_);
-        
+
+        for (auto &read : traverser.read_buffer_regions_) {
+          if (read->buffer.scope() == "global") {
+            continue;
+          }
+          used_buffers.insert(read->buffer);
+        }
+        for (auto &write : traverser.write_buffer_regions_) {
+          if (write->buffer.scope() == "global") {
+            continue;
+          }
+          used_buffers.insert(write->buffer);
+        }
         scheduler.AddCommand(cmd);
       }
     }
@@ -677,17 +395,59 @@ private:
       scheduler.calculate_bottom_level(cmd);
     }
 
-    for (auto &it : scheduler.b_level) {
-      LOG(INFO) << "Command " << it.first << " bottom level: " << it.second;
+    Scheduler remaining_scheduler;
+    PrimExpr remaining_iterations_expr = floormod(loop->extent, iterations);
+    int remaining_iterations = -1;
+    if (const auto *mod_int = remaining_iterations_expr.as<IntImmNode>()) {
+      remaining_iterations = mod_int->value;
+    }
+    ICHECK(remaining_iterations != -1)
+        << "Can't calculate the remaining iterations.";
+    // 1.2 Build For loop Commands and Dependencies
+    for (int i = 0; i < remaining_iterations; i++) {
+      for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
+        auto stmt = pipeline_body_seq->seq[j];
+        Command cmd(j, i, stmt);
+        traverser.traverse_stmt(stmt);
+        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                     traverser.write_buffer_regions_);
+        remaining_scheduler.AddCommand(cmd);
+      }
+    }
+
+    for (auto &cmd : remaining_scheduler.commands) {
+      remaining_scheduler.calculate_bottom_level(cmd);
     }
 
     // 2. Do critical path pipeline
     auto result = scheduler.CriticalPathPipeline();
+    auto remaining_result = remaining_scheduler.CriticalPathPipeline();
 
-    // 3. Process remaining commands
+    // Finally, make the pipeline annotation
+    Map<String, Any> annotations;
+    for (const auto &[key, value] : loop->annotations) {
+      if (key != "num_stages") {
+        annotations.Set(key, value);
+      }
+    }
+
+    annotations.Set("iterations", iterations);
+    Array<String> orders;
+    for (auto &it : result) {
+      orders.push_back(it.name);
+    }
+    annotations.Set("orders", orders);
+    orders.clear();
+    for (auto &it : remaining_result) {
+      orders.push_back(it.name);
+    }
+    annotations.Set("remaining_orders", orders);
+
+    Array<Buffer> used_buffers_array(used_buffers.begin(), used_buffers.end());
+    annotations.Set("used_buffers", used_buffers_array);
 
     return For(loop->loop_var, loop->min, loop->extent, loop->kind, loop->body,
-               loop->thread_binding, loop->annotations);
+               loop->thread_binding, annotations);
   }
 
 private:
