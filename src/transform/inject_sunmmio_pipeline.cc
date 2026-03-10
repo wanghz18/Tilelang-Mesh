@@ -1,24 +1,3 @@
-#include "../op/builtin.h"
-#include "common/ast_traverser.h"
-#include "tvm/ir/expr.h"
-#include "tvm/node/cast.h"
-#include "tvm/node/structural_equal.h"
-#include "tvm/runtime/logging.h"
-#include "tvm/tir/function.h"
-#include "tvm/tir/stmt.h"
-#include <tvm/ffi/reflection/registry.h>
-#include <tvm/ffi/container/array.h>
-#include <tvm/ffi/container/map.h>
-#include <tvm/ffi/reflection/registry.h>
-#include <tvm/ffi/string.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/expr.h>
-#include "../tileview/tileview.h"
 #include "../layout/utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -26,9 +5,26 @@
 #include "../op/region.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
+#include "../tileview/tileview.h"
+#include "common/ast_traverser.h"
 #include "common/loop_fusion_utils.h"
-// #include "common/loop_parallel_transform_utils.h"
 #include "common/remap_buffer_rewriter.h"
+#include "tvm/ir/expr.h"
+#include "tvm/node/cast.h"
+#include "tvm/node/structural_equal.h"
+#include "tvm/runtime/logging.h"
+#include "tvm/tir/function.h"
+#include "tvm/tir/stmt.h"
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/map.h>
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/ffi/string.h>
+#include <tvm/tir/analysis.h>
+#include <tvm/tir/builtin.h>
+#include <tvm/tir/expr.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
+#include <tvm/tir/transform.h>
 
 namespace tvm {
 namespace tl {
@@ -67,15 +63,20 @@ public:
     }
   }
 
-  static Stmt Substitute(const PrimFunc &f) {
+  static Stmt Substitute(PrimFunc &f) {
     MultiVersionBufferRewriter substituter(f);
     // collect used_buffers and iterations
     substituter.VisitStmt(f->body);
     substituter.replace_flag = true;
 
     for (auto &buffer : substituter.used_buffers_) {
-      substituter.buffer_remap_.Set(buffer, substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
+      substituter.buffer_remap_.Set(
+          buffer,
+          substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
     }
+
+    f.CopyOnWrite()->body =
+        RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
 
     return substituter.VisitStmt(f->body);
   }
@@ -88,18 +89,20 @@ private:
     if (var_remap_.count(buffer->data)) {
       new_var = var_remap_[buffer->data];
     } else {
-      Type new_type = PointerType(ptr_type->element_type, ptr_type->storage_scope);
+      Type new_type =
+          PointerType(ptr_type->element_type, ptr_type->storage_scope);
       new_var = Var(buffer->data->name_hint, new_type);
       var_remap_.Set(buffer->data, new_var);
     }
     auto shape = buffer->shape;
     shape.insert(shape.begin(), num_version);
-    return Buffer(new_var, buffer->dtype, shape, {},
-                  buffer->elem_offset, buffer->name, buffer->data_alignment,
-                  buffer->offset_factor, buffer->buffer_type);
+    return Buffer(new_var, buffer->dtype, shape, {}, buffer->elem_offset,
+                  buffer->name, buffer->data_alignment, buffer->offset_factor,
+                  buffer->buffer_type);
   }
 
-  BufferRegion RewritePipelineBufferRegion(const BufferRegion &buffer_region) const {
+  BufferRegion
+  RewritePipelineBufferRegion(const BufferRegion &buffer_region) const {
     auto it = buffer_remap_.find(buffer_region->buffer);
     if (it != buffer_remap_.end()) {
       Region new_region = buffer_region->region;
@@ -128,7 +131,7 @@ private:
       remap_used_buffer.push_back(buffer_remap_[it]);
     }
     loop.CopyOnWrite()->annotations.Set("used_buffers", remap_used_buffer);
-    
+
     return loop;
   }
 
@@ -163,7 +166,7 @@ private:
                      ->as<Map<Var, TileView>>()
                      .value();
       Map<Var, TileView> new_map;
-      for (const auto &[var, tileView] : map) {        
+      for (const auto &[var, tileView] : map) {
         if (var_remap_.count(var)) {
           new_map.Set(var_remap_[var], tileView);
         } else {
@@ -173,12 +176,14 @@ private:
       block.CopyOnWrite()->annotations.Set(attr::kTileViewMap, new_map);
     }
 
-    block.CopyOnWrite()->reads.MutateByApply([this](const BufferRegion &buffer_region) {
-      return RewritePipelineBufferRegion(buffer_region);
-    });
-    block.CopyOnWrite()->writes.MutateByApply([this](const BufferRegion &buffer_region) {
-      return RewritePipelineBufferRegion(buffer_region);
-    });
+    block.CopyOnWrite()->reads.MutateByApply(
+        [this](const BufferRegion &buffer_region) {
+          return RewritePipelineBufferRegion(buffer_region);
+        });
+    block.CopyOnWrite()->writes.MutateByApply(
+        [this](const BufferRegion &buffer_region) {
+          return RewritePipelineBufferRegion(buffer_region);
+        });
 
     // do block->alloc_buffers remap
     Array<Buffer> alloc_buffers = block->alloc_buffers;
@@ -244,32 +249,31 @@ private:
           op->dtype, op->op,
           {op->args[0], new_data, op->args[2], op->args[3], op->args[4]});
     } else if (op->op.same_as(RegionOp::Get())) {
-      RegionOp original_region(op->args);  
-      Buffer original_buffer = original_region->GetBuffer();  
+      RegionOp original_region(op->args);
+      Buffer original_buffer = original_region->GetBuffer();
 
-      if (!buffer_remap_.count(original_buffer)) {  
+      if (!buffer_remap_.count(original_buffer)) {
         return StmtExprMutator::VisitExpr_(op);
-      }  
-      
-      Buffer new_buffer = buffer_remap_[original_buffer];  
+      }
+
+      Buffer new_buffer = buffer_remap_[original_buffer];
       Array<Range> new_ranges = original_region->GetRanges();
       new_ranges.insert(new_ranges.begin(), Range(0, iterations_));
-       
-      Array<PrimExpr> new_args;  
-      new_args.push_back(BufferLoad(new_buffer,   
-                                  [new_ranges]() {  
-                                    Array<PrimExpr> mins;  
-                                    for (auto r : new_ranges) {  
-                                      mins.push_back(r->min);  
-                                    }  
-                                    return mins;  
-                                  }()));  
-      new_args.push_back(original_region->GetAccessMask());  
-      for (auto r : new_ranges) {  
-        new_args.push_back(r->extent);  
-      }  
-      
-      return Call(DataType::Handle(), RegionOp::Get(), new_args);  
+
+      Array<PrimExpr> new_args;
+      new_args.push_back(BufferLoad(new_buffer, [new_ranges]() {
+        Array<PrimExpr> mins;
+        for (auto r : new_ranges) {
+          mins.push_back(r->min);
+        }
+        return mins;
+      }()));
+      new_args.push_back(original_region->GetAccessMask());
+      for (auto r : new_ranges) {
+        new_args.push_back(r->extent);
+      }
+
+      return Call(DataType::Handle(), RegionOp::Get(), new_args);
     }
     auto expr = StmtExprMutator::VisitExpr_(op);
     return expr;
@@ -300,18 +304,14 @@ public:
   PipelineBodyRewriter(Array<Buffer> used_buffers, For pipeline_loop) {
     used_buffers_ = used_buffers;
     pipeline_loop_ = std::move(pipeline_loop);
-    for (auto it: used_buffers) {
+    for (auto it : used_buffers) {
       buffer_data_to_buffer_.Set(it->data, it);
     }
   }
 
-  void set_current_version(int v) {
-    current_version_ = v;
-  }
+  void set_current_version(int v) { current_version_ = v; }
 
-  void set_loop_var_replacement(PrimExpr p) {
-    replaced_loop_var_ = p;
-  }
+  void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
 
 private:
   PrimExpr RewriteBufferAccess(const Call &call,
@@ -340,11 +340,12 @@ private:
       //   }
       //   PrimExpr new_index =
       //       old_index +
-      //       floormod(pipeline_loop_->loop_var, new_buffer->shape[0]) * offset;
+      //       floormod(pipeline_loop_->loop_var, new_buffer->shape[0]) *
+      //       offset;
       //   LOG(INFO) << new_index;
       //   new_args.Set(i + 1, new_index);
-      }
-    return Call(call->dtype, call->op, new_args, call->span);
+    }
+    return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
@@ -362,7 +363,7 @@ private:
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
     bool count = false;
-    for (auto it: used_buffers_) {
+    for (auto it : used_buffers_) {
       if (StructuralEqual()(it, store->buffer))
         count = true;
     }
@@ -377,7 +378,7 @@ private:
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
     bool count = false;
-    for (auto it: used_buffers_) {
+    for (auto it : used_buffers_) {
       if (StructuralEqual()(it, load->buffer))
         count = true;
     }
@@ -388,7 +389,6 @@ private:
     n->indices.Set(0, current_version_);
     return load;
   }
-
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
@@ -413,7 +413,6 @@ private:
   PrimExpr replaced_loop_var_;
 };
 
-
 class SunmmioPipelineInjector : public StmtExprMutator {
 public:
   static Stmt Inject(const PrimFunc &func) {
@@ -427,7 +426,8 @@ public:
   }
 
 private:
-  explicit SunmmioPipelineInjector(Optional<String> global_symbol, const PrimFunc &f)
+  explicit SunmmioPipelineInjector(Optional<String> global_symbol,
+                                   const PrimFunc &f)
       : global_symbol_(std::move(global_symbol)), traverser_(f) {
     traverser_.clear();
   }
@@ -539,8 +539,9 @@ private:
 
     int iterations = Downcast<IntImm>(iterations_anno.value())->value;
     Array<String> orders = Downcast<Array<String>>(orders_anno.value());
-    Array<Buffer> used_buffers = Downcast<Array<Buffer>>(used_buffers_anno.value());
-    for (auto it:used_buffers) {
+    Array<Buffer> used_buffers =
+        Downcast<Array<Buffer>>(used_buffers_anno.value());
+    for (auto it : used_buffers) {
       pipeline_allocs.push_back(it);
     }
 
@@ -548,7 +549,7 @@ private:
     // Step 3.1: Rewrite the for body of loop.
     Array<Stmt> new_for_body;
     auto rewriter = PipelineBodyRewriter(used_buffers, for_node);
-    for (const auto& order_str : orders) {
+    for (const auto &order_str : orders) {
       std::string s = order_str;
       size_t dash_pos = s.find('-');
       int iter = -1;
@@ -557,26 +558,30 @@ private:
         iter = std::stoi(s.substr(0, dash_pos));
         id = std::stoi(s.substr(dash_pos + 1));
       }
-      ICHECK(iter != -1 && id != -1) << "Can't phrase id from order: " << order_str;
+      ICHECK(iter != -1 && id != -1)
+          << "Can't phrase id from order: " << order_str;
 
       Stmt stmt = pipeline_body_seq->seq[id];
       rewriter.set_current_version(iter);
-      PrimExpr replaced_loop_var = iterations * for_node->loop_var + iter + for_node->min;
+      PrimExpr replaced_loop_var =
+          iterations * for_node->loop_var + iter + for_node->min;
       rewriter.set_loop_var_replacement(replaced_loop_var);
       stmt = rewriter(stmt);
       new_for_body.push_back(stmt);
     }
 
     auto extent = floordiv(for_node->extent, iterations);
-    For new_for_stmt = For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial, SeqStmt::Flatten(new_for_body),
-               for_node->thread_binding, {});
+    For new_for_stmt =
+        For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial,
+            SeqStmt::Flatten(new_for_body), for_node->thread_binding, {});
     new_body.push_back(new_for_stmt);
 
     // Step 3.2 Rewrite the remaining statements
     if (remaining_orders_anno) {
-      Array<String> remaining_orders = Downcast<Array<String>>(remaining_orders_anno.value());
+      Array<String> remaining_orders =
+          Downcast<Array<String>>(remaining_orders_anno.value());
       Array<Stmt> remaining;
-      for (const auto& order_str : remaining_orders) {
+      for (const auto &order_str : remaining_orders) {
         std::string s = order_str;
         size_t dash_pos = s.find('-');
         int iter = -1;
@@ -585,7 +590,8 @@ private:
           iter = std::stoi(s.substr(0, dash_pos));
           id = std::stoi(s.substr(dash_pos + 1));
         }
-        ICHECK(iter != -1 && id != -1) << "Can't phrase id from order: " << order_str;
+        ICHECK(iter != -1 && id != -1)
+            << "Can't phrase id from order: " << order_str;
 
         Stmt stmt = pipeline_body_seq->seq[id];
         rewriter.set_current_version(iter);
@@ -616,7 +622,8 @@ tvm::transform::Pass InjectSunmmioPipeline() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectSunmmioPipeline", InjectSunmmioPipeline);
+  refl::GlobalDef().def("tl.transform.InjectSunmmioPipeline",
+                        InjectSunmmioPipeline);
 }
 
 } // namespace tl

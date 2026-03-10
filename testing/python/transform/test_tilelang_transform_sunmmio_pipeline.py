@@ -1,17 +1,12 @@
 import tilelang
 import pytest
 from tilelang import tvm as tvm
-from tilelang.layout.hierarchical_layout import make_blockwise_zz_layout
-from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
-from tvm.tir.stmt_functor import post_order_visit
-from tvm.tir import BufferLoad, BufferStore, Buffer, Block
-from typing import Set
 from tilelang.tileview import make_tileview
 from tilelang.engine.phase import LowerAndLegalize
-from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
-from tilelang.language.v2.annot import MeshShardingPolicy
+from tilelang.utils.target import SUNMMIO_TARGET_DESC
+from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accum_dtype="float"):
@@ -20,24 +15,33 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accu
 
     @T.prim_func
     def gemm(
-            A: T.MeshTensor((M, K),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
-            B: T.MeshTensor((K, N),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
-            C: T.MeshTensor((M, N),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=accum_dtype),
+        A: T.MeshTensor(
+            (M, K),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (K, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (M, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=accum_dtype,
+        ),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -61,19 +65,20 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accu
 
     return gemm
 
+
 def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
-    scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
+    scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape = [batch, heads, seq_len, dim]
     dtype = "float16"
     accum_dtype = "float"
 
     @T.prim_func
     def flash_fwd(
-            Q: T.Tensor(shape, dtype),  # type: ignore
-            K: T.Tensor(shape, dtype),  # type: ignore
-            V: T.Tensor(shape, dtype),  # type: ignore
-            Output: T.Tensor(shape, dtype),  # type: ignore
-            lse: T.Tensor([batch, heads, seq_len], accum_dtype),  # type: ignore
+        Q: T.Tensor(shape, dtype),  # type: ignore
+        K: T.Tensor(shape, dtype),  # type: ignore
+        V: T.Tensor(shape, dtype),  # type: ignore
+        Output: T.Tensor(shape, dtype),  # type: ignore
+        lse: T.Tensor([batch, heads, seq_len], accum_dtype),  # type: ignore
     ):
         with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=128) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], dtype)
@@ -90,28 +95,24 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
             logsum = T.alloc_shared([block_M], accum_dtype)
 
             T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
-            T.copy(Q[bz, by, bx * block_M:(bx + 1) * block_M, :], Q_shared)
+            T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
             # T.copy(Q_shared, Q_local)
             # for i, j in T.Parallel(block_M, dim):
             #     Q_local[i, j] *= scale
-            loop_range = (
-                T.ceildiv(
-                    (bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N))
+            loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
             for k in T.Pipelined(loop_range, num_stages=1):
-                T.copy(K[bz, by, k * block_N:(k + 1) * block_N, :], K_shared)
+                T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0,
-                                                     -T.infinity(acc_s.dtype))
+                        acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
                 else:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len,
-                                                     -T.infinity(acc_s.dtype), 0)
+                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                T.copy(V[bz, by, k * block_N:(k + 1) * block_N, :], V_shared)
+                T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
                 T.copy(scores_max, scores_max_prev)
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(block_M):
@@ -129,10 +130,10 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, Output[bz, by, bx * block_M:(bx + 1) * block_M, :])
+            T.copy(acc_o, Output[bz, by, bx * block_M : (bx + 1) * block_M, :])
             for i in T.Parallel(block_M):
                 logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
-            T.copy(logsum, lse[bz, by, bx * block_M:(bx + 1) * block_M])
+            T.copy(logsum, lse[bz, by, bx * block_M : (bx + 1) * block_M])
 
     return flash_fwd
 
@@ -150,8 +151,6 @@ CASES = [
     "kernel",
     CASES,
 )
-
-
 def test_tilelang_transform_sunmmio_pipeline(kernel):
     mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
     name = SUNMMIO_TARGET_DESC
@@ -159,7 +158,7 @@ def test_tilelang_transform_sunmmio_pipeline(kernel):
     target = tvm.target.Target(name)
 
     with target:
-        mod = LowerAndLegalize(mod, target)    
+        mod = LowerAndLegalize(mod, target)
         if name == SUNMMIO_TARGET_DESC:
             mod = tl.transform.SunmmioPipelinePlanning()(mod)
         elif name == "cuda":
