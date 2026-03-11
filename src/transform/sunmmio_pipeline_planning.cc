@@ -51,6 +51,10 @@ int name2iter(const std::string &name) {
   return std::stoi(name.substr(0, name.find('-')));
 }
 
+int name2id(const std::string &name) {
+  return std::stoi(name.substr(name.find('-') + 1));
+}
+
 enum class DeviceType {
   ODMA,
   TensorCore,
@@ -223,8 +227,10 @@ public:
   void AddCommand(Command cmd) { commands.push_back(cmd); }
 
   float calculate_bottom_level(Command command) {
-    if (b_level.find(command.name) != b_level.end()) {
-      return b_level[command.name];
+    // for Memoization
+    auto key = "0-" + std::to_string(name2id(command.name));
+    if (b_level.find(key) != b_level.end()) {
+      return b_level[key];
     }
 
     std::vector<Command> dependent_commands;
@@ -267,8 +273,10 @@ public:
     }
     sort(command_queue.begin(), command_queue.end(),
          [this](Command *a, Command *b) {
-           if (b_level[a->name] != b_level[b->name]) {
-             return b_level[a->name] > b_level[b->name];
+           auto a_key = "0-" + std::to_string(name2id(a->name));
+           auto b_key = "0-" + std::to_string(name2id(b->name));
+           if (b_level[a_key] != b_level[b_key]) {
+             return b_level[a_key] > b_level[b_key];
            }
            return name2iter(a->name) < name2iter(b->name);
          });
