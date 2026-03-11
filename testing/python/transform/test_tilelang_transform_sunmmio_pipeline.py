@@ -1,4 +1,3 @@
-import tilelang
 import pytest
 from tilelang import tvm as tvm
 import tilelang as tl
@@ -69,7 +68,7 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accu
 def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape = [batch, heads, seq_len, dim]
-    dtype = "float16"
+    dtype = "float"
     accum_dtype = "float"
 
     @T.prim_func
@@ -94,7 +93,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
             scores_sum = T.alloc_shared([block_M], accum_dtype)
             logsum = T.alloc_shared([block_M], accum_dtype)
 
-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+            # T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
@@ -103,7 +102,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
             # for i, j in T.Parallel(block_M, dim):
             #     Q_local[i, j] *= scale
             loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
-            for k in T.Pipelined(loop_range, num_stages=1):
+            for k in T.Pipelined(loop_range, num_stages=3):
                 T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
@@ -114,7 +113,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
                 T.copy(scores_max, scores_max_prev)
-                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                # T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(block_M):
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
                 for i in T.Parallel(block_M):
@@ -125,7 +124,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
                     acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
                 T.copy(acc_s, acc_s_cast)
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-                T.reduce_sum(acc_s, scores_sum, dim=1)
+                # T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
             for i, j in T.Parallel(block_M, dim):
@@ -141,9 +140,9 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N):
 CASES = [
     # matmul(1024, 1024, 1024, 32, 32, 32, 3),
     # matmul(1024, 1024, 1024, 32, 32, 32, 4),
-    matmul(1024, 1024, 1024, 32, 32, 32, 5),
+    # matmul(1024, 1024, 1024, 32, 32, 32, 5),
     # matmul(1024, 1024, 1024, 64, 64, 64, 3),
-    # flashattn_fwd(batch=2, heads=16, seq_len=1024, dim=128, is_causal=False, block_M=32, block_N=32),
+    flashattn_fwd(batch=2, heads=16, seq_len=1024, dim=128, is_causal=False, block_M=32, block_N=32),
 ]
 
 
@@ -159,12 +158,13 @@ def test_tilelang_transform_sunmmio_pipeline(kernel):
 
     with target:
         mod = LowerAndLegalize(mod, target)
+
         if name == SUNMMIO_TARGET_DESC:
             mod = tl.transform.SunmmioPipelinePlanning()(mod)
         elif name == "cuda":
             mod = tl.transform.PipelinePlanning()(mod)
 
-        # mod.show()
+        mod.show()
         if name == SUNMMIO_TARGET_DESC:
             mod = tl.transform.InjectSunmmioPipeline()(mod)
         elif name == "cuda":

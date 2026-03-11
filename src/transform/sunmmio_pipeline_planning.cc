@@ -9,6 +9,7 @@
 #include "tvm/tir/function.h"
 #include "tvm/tir/stmt.h"
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <tvm/arith/analyzer.h>
@@ -22,6 +23,8 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 #include <vector>
+
+#define DEBUG true
 
 namespace tvm {
 namespace tl {
@@ -42,6 +45,10 @@ bool RegionIntersect(const Region &region1, const Region &region2) {
     }
   }
   return true;
+}
+
+int name2iter(const std::string &name) {
+  return std::stoi(name.substr(0, name.find('-')));
 }
 
 enum class DeviceType {
@@ -145,8 +152,11 @@ public:
   get_dependent_commands(std::vector<Command> &all_commands) {
     std::vector<Command> dependencies;
     for (auto &cmd : all_commands) {
-      if (cmd.name == name || cmd.iter != iter) {
+      if (cmd.iter != iter) {
         continue;
+      }
+      if (cmd.name == name) {
+        break;
       }
       if (!cmd.finished && blocked(cmd)) {
         dependencies.push_back(cmd);
@@ -159,12 +169,9 @@ public:
                                 std::set<BufferRegion> &write_buffer_regions_) {
     for (auto &it : read_buffer_regions_) {
       reads.push_back(it);
-      // LOG(INFO) << name << " read " << it->buffer->name << " " << it->region;
     }
     for (auto &it : write_buffer_regions_) {
       writes.push_back(it);
-      // LOG(INFO) << name << " write " << it->buffer->name << " " <<
-      // it->region;
     }
   }
 
@@ -258,6 +265,13 @@ public:
     for (auto &command : commands) {
       command_queue.push_back(&command);
     }
+    sort(command_queue.begin(), command_queue.end(),
+         [this](Command *a, Command *b) {
+           if (b_level[a->name] != b_level[b->name]) {
+             return b_level[a->name] > b_level[b->name];
+           }
+           return name2iter(a->name) < name2iter(b->name);
+         });
     float time = 0;
     std::vector<Command> schedule;
 
@@ -274,6 +288,18 @@ public:
           for (auto &device : devices) {
             if (device.type == command->type && !device.busy) {
               device.assign_command(command, time);
+              if (DEBUG) {
+                LOG(INFO) << "Command " << command->name
+                          << " assigned to device " << int(device.type)
+                          << " at time " << time << " with delay "
+                          << command->get_delay();
+                std::ofstream log_file("sunmmio_pipeline_schedule.log",
+                                       std::ios::app);
+                if (log_file.is_open()) {
+                  log_file << command->name << " " << int(device.type) << " "
+                           << time << " " << command->get_delay() << std::endl;
+                }
+              }
               schedule.push_back(*command);
               break;
             }
@@ -359,7 +385,6 @@ private:
     }
     ICHECK(pipeline_body_seq != nullptr);
 
-    CHECK(num_stages >= 1);
     CHECK(loop->kind == ForKind::kSerial);
 
     Scheduler scheduler;
@@ -394,6 +419,11 @@ private:
     for (auto &cmd : scheduler.commands) {
       scheduler.calculate_bottom_level(cmd);
     }
+    if (DEBUG) {
+      for (auto &it : scheduler.b_level) {
+        LOG(INFO) << it.first << ' ' << it.second;
+      }
+    }
 
     Scheduler remaining_scheduler;
     PrimExpr remaining_iterations_expr = floormod(loop->extent, iterations);
@@ -421,12 +451,13 @@ private:
 
     // 2. Do critical path pipeline
     auto result = scheduler.CriticalPathPipeline();
-    auto remaining_result = remaining_scheduler.CriticalPathPipeline();
+    std::vector<Command> remaining_result =
+        remaining_scheduler.CriticalPathPipeline();
 
     // Finally, make the pipeline annotation
     Map<String, Any> annotations;
     for (const auto &[key, value] : loop->annotations) {
-      if (key != "num_stages") {
+      if (key != "num_stages" && key != "used_buffers") {
         annotations.Set(key, value);
       }
     }
