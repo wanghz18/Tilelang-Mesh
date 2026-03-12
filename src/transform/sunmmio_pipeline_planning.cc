@@ -180,6 +180,8 @@ public:
   }
 
   void set_finished(bool finished) { this->finished = finished; }
+
+  bool operator==(const Command &cmd) const { return name == cmd.name; }
 };
 
 class Device {
@@ -224,23 +226,21 @@ public:
     devices.push_back(Device(DeviceType::VectorCore));
   }
 
-  void AddCommand(Command cmd) { commands.push_back(cmd); }
-
   float calculate_bottom_level(Command command) {
     // for Memoization
-    auto key = "0-" + std::to_string(name2id(command.name));
+    std::string key = command.name;
     if (b_level.find(key) != b_level.end()) {
       return b_level[key];
     }
 
     std::vector<Command> dependent_commands;
     for (auto &cmd : commands) {
-      if (cmd.name == command.name || cmd.iter != command.iter) {
+      if (cmd.name == key || cmd.iter != command.iter) {
         continue;
       }
       auto deps = cmd.get_dependent_commands(commands);
       for (auto &dep : deps) {
-        if (dep.name == command.name)
+        if (dep.name == key)
           dependent_commands.push_back(cmd);
       }
     }
@@ -258,13 +258,13 @@ public:
       path = max_dependent_level + const_cast<Command &>(command).get_delay();
     }
 
-    b_level[command.name] = path;
+    b_level[key] = path;
     return path;
   }
 
   int num_stages_to_iterations(int num_stages) { return num_stages; }
 
-  std::vector<Command> CriticalPathPipeline() {
+  std::vector<Command> CriticalPathPipeline(std::string log_file_name) {
 
     std::vector<Command *> command_queue;
     command_queue.reserve(commands.size());
@@ -278,10 +278,16 @@ public:
            if (b_level[a_key] != b_level[b_key]) {
              return b_level[a_key] > b_level[b_key];
            }
-           return name2iter(a->name) < name2iter(b->name);
+           if (name2iter(a->name) != name2iter(b->name)) {
+             return name2iter(a->name) < name2iter(b->name);
+           }
+           return name2id(a->name) < name2id(b->name);
          });
     float time = 0;
     std::vector<Command> schedule;
+    if (DEBUG) {
+      LOG(INFO) << "Scheduling starts.";
+    }
 
     while (!command_queue.empty()) {
       // Try to schedule commands in priority order
@@ -301,11 +307,10 @@ public:
                           << " assigned to device " << int(device.type)
                           << " at time " << time << " with delay "
                           << command->get_delay();
-                std::ofstream log_file("sunmmio_pipeline_schedule.log",
-                                       std::ios::app);
+                std::ofstream log_file(log_file_name, std::ios::app);
                 if (log_file.is_open()) {
                   log_file << command->name << " " << int(device.type) << " "
-                           << time << " " << command->get_delay() << std::endl;
+                           << time << " " << command->get_delay() << '\n';
                 }
               }
               schedule.push_back(*command);
@@ -395,72 +400,182 @@ private:
 
     CHECK(loop->kind == ForKind::kSerial);
 
+    // 1.1 Build Iter0 Commands
     Scheduler scheduler;
     int iterations = scheduler.num_stages_to_iterations(num_stages);
     std::set<Buffer> used_buffers;
+    std::vector<Command> iter0_commands;
+    for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
+      auto stmt = pipeline_body_seq->seq[j];
+      Command cmd(j, 0, stmt);
+      traverser.traverse_stmt(stmt);
+      cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                   traverser.write_buffer_regions_);
 
-    // 1.1 Build For loop Commands and Dependencies
+      for (auto &read : traverser.read_buffer_regions_) {
+        if (read->buffer.scope() == "global") {
+          continue;
+        }
+        used_buffers.insert(read->buffer);
+      }
+      for (auto &write : traverser.write_buffer_regions_) {
+        if (write->buffer.scope() == "global") {
+          continue;
+        }
+        used_buffers.insert(write->buffer);
+      }
+      iter0_commands.push_back(cmd);
+    }
+    if (DEBUG) {
+      for (auto &it : iter0_commands) {
+        LOG(INFO) << it.name;
+      }
+    }
+
+    // 1.2 Build Prologue Commands with Iter0 Commands
+    std::vector<Command> prologue_commands;
+    Array<String> prologue_orders;
+    std::vector<int> prologue_ids;
+    for (auto &cmd : iter0_commands) {
+      // only ODMA operations
+      if (cmd.type == DeviceType::ODMA) {
+        auto deps = cmd.get_dependent_commands(iter0_commands);
+        if (deps.empty()) {
+          prologue_commands.push_back(cmd);
+          prologue_orders.push_back(cmd.name);
+          prologue_ids.push_back(name2id(cmd.name));
+        }
+      }
+    }
+    if (DEBUG) {
+      LOG(INFO) << "Prologue Commands:";
+      for (auto &cmd : prologue_commands) {
+        LOG(INFO) << cmd.name;
+      }
+    }
+    if (DEBUG) {
+      std::ofstream log_file("prologue.log", std::ios::app);
+      if (log_file.is_open()) {
+        int time = 0;
+        for (auto &command : prologue_commands) {
+          log_file << command.name << " " << int(command.type) << " " << time
+                   << " " << command.get_delay() << '\n';
+          time += command.get_delay();
+        }
+      }
+    }
+
+    // 1.3 Build Body Commands
     for (int i = 0; i < iterations; i++) {
       for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
+        if (std::find(prologue_ids.begin(), prologue_ids.end(), j) !=
+            prologue_ids.end()) {
+          continue;
+        }
         auto stmt = pipeline_body_seq->seq[j];
         Command cmd(j, i, stmt);
         traverser.traverse_stmt(stmt);
         cmd.get_command_reads_writes(traverser.read_buffer_regions_,
                                      traverser.write_buffer_regions_);
 
-        for (auto &read : traverser.read_buffer_regions_) {
-          if (read->buffer.scope() == "global") {
-            continue;
-          }
-          used_buffers.insert(read->buffer);
-        }
-        for (auto &write : traverser.write_buffer_regions_) {
-          if (write->buffer.scope() == "global") {
-            continue;
-          }
-          used_buffers.insert(write->buffer);
-        }
-        scheduler.AddCommand(cmd);
+        scheduler.commands.push_back(cmd);
       }
+
+      for (auto &command : prologue_commands) {
+        Command cmd(name2id(command.name), i + 1, command.stmt);
+        traverser.traverse_stmt(cmd.stmt);
+        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                     traverser.write_buffer_regions_);
+
+        scheduler.commands.push_back(cmd);
+      }
+    }
+
+    if (DEBUG) {
+      LOG(INFO) << "Body Commands:";
+      for (auto &cmd : scheduler.commands) {
+        LOG(INFO) << cmd.name;
+      }
+
+      ICHECK(scheduler.commands.size() ==
+             pipeline_body_seq->size() * iterations);
+    }
+
+    // 1.4 Build Epilogue Commands
+    Scheduler epilogue_scheduler;
+    PrimExpr epilogue_iterations_expr = floormod(loop->extent, iterations);
+    int epilogue_iterations = -1;
+    if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {
+      epilogue_iterations = mod_int->value;
+    }
+    ICHECK(epilogue_iterations != -1)
+        << "Can't calculate the epilogue iterations.";
+
+    if (epilogue_iterations == 0) {
+      epilogue_iterations = iterations;
+    }
+    // 1.4.1 Epilogue Loop
+    int epilogue_iter = 0;
+    for (int i = 0; i < epilogue_iterations - 1; i++) {
+      for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
+        auto command = scheduler.commands[i * pipeline_body_seq->size() + j];
+        int iter = name2iter(command.name);
+        int id = name2id(command.name);
+        Command cmd(id, iter, command.stmt);
+        traverser.traverse_stmt(command.stmt);
+        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                     traverser.write_buffer_regions_);
+        epilogue_scheduler.commands.push_back(cmd);
+        LOG(INFO) << "epilogue add " << cmd.name;
+      }
+      epilogue_iter += 1;
+    }
+
+    // 1.4.2 The End of Epilogue
+    for (auto &command : iter0_commands) {
+      LOG(INFO) << "iter0 " << command.name;
+      if (std::find(prologue_orders.begin(), prologue_orders.end(),
+                    command.name) == prologue_orders.end()) {
+        int iter = name2iter(command.name);
+        int id = name2id(command.name);
+        Command cmd(id, epilogue_iter, command.stmt);
+        traverser.traverse_stmt(command.stmt);
+        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                     traverser.write_buffer_regions_);
+        epilogue_scheduler.commands.push_back(cmd);
+        LOG(INFO) << "epilogue add " << cmd.name;
+      }
+    }
+    if (DEBUG) {
+      LOG(INFO) << "Epilogue Commands:";
+      for (auto &it : epilogue_scheduler.commands)
+        LOG(INFO) << it.name;
     }
 
     for (auto &cmd : scheduler.commands) {
       scheduler.calculate_bottom_level(cmd);
     }
     if (DEBUG) {
+      LOG(INFO) << "Body Bottom Level:";
       for (auto &it : scheduler.b_level) {
         LOG(INFO) << it.first << ' ' << it.second;
       }
     }
 
-    Scheduler remaining_scheduler;
-    PrimExpr remaining_iterations_expr = floormod(loop->extent, iterations);
-    int remaining_iterations = -1;
-    if (const auto *mod_int = remaining_iterations_expr.as<IntImmNode>()) {
-      remaining_iterations = mod_int->value;
+    for (auto &cmd : epilogue_scheduler.commands) {
+      epilogue_scheduler.calculate_bottom_level(cmd);
     }
-    ICHECK(remaining_iterations != -1)
-        << "Can't calculate the remaining iterations.";
-    // 1.2 Build For loop Commands and Dependencies
-    for (int i = 0; i < remaining_iterations; i++) {
-      for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
-        auto stmt = pipeline_body_seq->seq[j];
-        Command cmd(j, i, stmt);
-        traverser.traverse_stmt(stmt);
-        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
-                                     traverser.write_buffer_regions_);
-        remaining_scheduler.AddCommand(cmd);
+    if (DEBUG) {
+      LOG(INFO) << "Epilogue Bottom Level:";
+      for (auto &it : epilogue_scheduler.b_level) {
+        LOG(INFO) << it.first << ' ' << it.second;
       }
     }
 
-    for (auto &cmd : remaining_scheduler.commands) {
-      remaining_scheduler.calculate_bottom_level(cmd);
-    }
-
     // 2. Do critical path pipeline
-    auto result = scheduler.CriticalPathPipeline();
-    std::vector<Command> remaining_result =
-        remaining_scheduler.CriticalPathPipeline();
+    auto result = scheduler.CriticalPathPipeline("body.log");
+    std::vector<Command> epilogue_result =
+        epilogue_scheduler.CriticalPathPipeline("epilogue.log");
 
     // Finally, make the pipeline annotation
     Map<String, Any> annotations;
@@ -471,16 +586,17 @@ private:
     }
 
     annotations.Set("iterations", iterations);
+    annotations.Set("prologue_orders", prologue_orders);
     Array<String> orders;
     for (auto &it : result) {
       orders.push_back(it.name);
     }
-    annotations.Set("orders", orders);
+    annotations.Set("body_orders", orders);
     orders.clear();
-    for (auto &it : remaining_result) {
+    for (auto &it : epilogue_result) {
       orders.push_back(it.name);
     }
-    annotations.Set("remaining_orders", orders);
+    annotations.Set("epilogue_orders", orders);
 
     Array<Buffer> used_buffers_array(used_buffers.begin(), used_buffers.end());
     annotations.Set("used_buffers", used_buffers_array);
