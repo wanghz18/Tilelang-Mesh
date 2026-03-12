@@ -24,7 +24,7 @@
 #include <tvm/tir/transform.h>
 #include <vector>
 
-#define DEBUG true
+#define DEBUG false
 
 namespace tvm {
 namespace tl {
@@ -526,14 +526,12 @@ private:
         cmd.get_command_reads_writes(traverser.read_buffer_regions_,
                                      traverser.write_buffer_regions_);
         epilogue_scheduler.commands.push_back(cmd);
-        LOG(INFO) << "epilogue add " << cmd.name;
       }
       epilogue_iter += 1;
     }
 
     // 1.4.2 The End of Epilogue
     for (auto &command : iter0_commands) {
-      LOG(INFO) << "iter0 " << command.name;
       if (std::find(prologue_orders.begin(), prologue_orders.end(),
                     command.name) == prologue_orders.end()) {
         int iter = name2iter(command.name);
@@ -543,7 +541,6 @@ private:
         cmd.get_command_reads_writes(traverser.read_buffer_regions_,
                                      traverser.write_buffer_regions_);
         epilogue_scheduler.commands.push_back(cmd);
-        LOG(INFO) << "epilogue add " << cmd.name;
       }
     }
     if (DEBUG) {
