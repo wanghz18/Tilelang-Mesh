@@ -26,8 +26,6 @@
 #include <unordered_set>
 #include <vector>
 
-#define DEBUG false
-
 namespace tvm {
 namespace tl {
 
@@ -262,6 +260,7 @@ public:
   std::vector<Command> commands;
   std::vector<Device> devices;
 
+  bool debug_{false};
   std::map<std::string, int> b_level;
   std::unordered_map<std::string, int> name_to_index_;
   std::unordered_map<int, std::string> index_to_name_;
@@ -284,6 +283,9 @@ public:
   }
 
   void DumpGraph(const std::string &file_name) const {
+    if (!debug_) {
+      return;
+    }
     std::ofstream log_file(file_name, std::ios::out);
     if (!log_file.is_open()) {
       return;
@@ -464,7 +466,7 @@ public:
 
   std::vector<Command> CriticalPathPipeline(std::string log_file_name) {
     std::ofstream log_file;
-    if (DEBUG) {
+    if (debug_) {
       log_file.open(log_file_name, std::ios::out);
     }
 
@@ -496,7 +498,7 @@ public:
     sort(primary_queue.begin(), primary_queue.end(), primary_cmp);
     float time = 0;
     std::vector<Command> schedule;
-    if (DEBUG) {
+    if (debug_) {
       LOG(INFO) << "Scheduling starts.";
     }
 
@@ -523,7 +525,7 @@ public:
           for (auto &device : devices) {
             if (device.type == command->type && !device.busy) {
               device.assign_command(command, time);
-              if (DEBUG) {
+              if (debug_) {
                 LOG(INFO) << "Command " << command->name
                           << " assigned to device " << int(device.type)
                           << " at time " << time << " with delay "
@@ -623,7 +625,7 @@ public:
                 return a.name < b.name;
               });
 
-    if (DEBUG && log_file.is_open()) {
+    if (debug_ && log_file.is_open()) {
       for (const auto &cmd : schedule) {
         log_file << (cmd.is_prefetch ? "p:" : "") << cmd.name << " "
                  << int(cmd.type) << " " << cmd.scheduled_start << " "
@@ -636,12 +638,13 @@ public:
 
 class SunmmioPipelinePlanner : public StmtExprMutator {
 public:
-  static Stmt Substitute(const PrimFunc &f) {
-    SunmmioPipelinePlanner substituter(f);
+  static Stmt Substitute(const PrimFunc &f, bool debug) {
+    SunmmioPipelinePlanner substituter(f, debug);
     return substituter.VisitStmt(f->body);
   }
 
-  SunmmioPipelinePlanner(const PrimFunc &f) : traverser(f) {
+  SunmmioPipelinePlanner(const PrimFunc &f, bool debug)
+      : traverser(f), debug_(debug) {
     traverser.clear();
   }
 
@@ -843,7 +846,7 @@ private:
       }
     }
 
-    if (DEBUG) {
+    if (debug_) {
       LOG(INFO) << versioned_buffers;
     }
 
@@ -938,23 +941,27 @@ private:
     }
 
     prologue_scheduler.SetVersionedBuffers(versioned_buffers);
+    prologue_scheduler.debug_ = debug_;
     prologue_scheduler.BuildDependencyGraph();
     prologue_scheduler.CalculateBottomLevels();
 
     body_scheduler.SetVersionedBuffers(versioned_buffers);
+    body_scheduler.debug_ = debug_;
     body_scheduler.BuildDependencyGraph();
     body_scheduler.CalculateBottomLevels();
-    if (DEBUG) {
+    if (debug_) {
       body_scheduler.DumpGraph("body_graph.log");
       LOG(INFO) << "Body Bottom Level:";
       for (auto &it : body_scheduler.b_level) {
         LOG(INFO) << it.first << ' ' << it.second;
       }
     }
+
     epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
+    epilogue_scheduler.debug_ = debug_;
     epilogue_scheduler.BuildDependencyGraph();
     epilogue_scheduler.CalculateBottomLevels();
-    if (DEBUG) {
+    if (debug_) {
       LOG(INFO) << "Epilogue Bottom Level:";
       for (auto &it : epilogue_scheduler.b_level) {
         LOG(INFO) << it.first << ' ' << it.second;
@@ -1004,13 +1011,14 @@ private:
 
 private:
   ASTTraverser traverser;
+  bool debug_{false};
 };
 
-tvm::transform::Pass SunmmioPipelinePlanning() {
+tvm::transform::Pass SunmmioPipelinePlanning(bool debug = false) {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = SunmmioPipelinePlanner::Substitute(f);
+    fptr->body = SunmmioPipelinePlanner::Substitute(f, debug);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.SunmmioPipelinePlanning", {});

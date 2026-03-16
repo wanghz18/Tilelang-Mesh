@@ -608,7 +608,7 @@ def LowerLDGSTG():
     return _ffi_api.LowerLDGSTG()  # type: ignore
 
 
-def SunmmioPipelinePlanning():
+def SunmmioPipelinePlanning(debug: bool = False):
     """InjectSunmmioPipeline
 
     Returns
@@ -616,7 +616,7 @@ def SunmmioPipelinePlanning():
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.SunmmioPipelinePlanning()  # type: ignore
+    return _ffi_api.SunmmioPipelinePlanning(debug)  # type: ignore
 
 
 def InjectSunmmioPipeline():
