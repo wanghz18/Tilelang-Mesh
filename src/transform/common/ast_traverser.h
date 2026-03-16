@@ -1,3 +1,6 @@
+#ifndef AST_TRAVERSER_H
+#define AST_TRAVERSER_H
+
 #include "../../op/builtin.h"
 #include "../../op/utils.h"
 #include "tvm/ir/expr.h"
@@ -296,6 +299,11 @@ public:
     VisitStmt(stmt);
   }
 
+  void traverse_expr(PrimExpr expr) {
+    clear();
+    buffer_region_collector(expr);
+  }
+
 public:
   Map<Var, Buffer> buffer_data_to_buffer_;
 
@@ -305,3 +313,5 @@ public:
 
 } // namespace tl
 } // namespace tvm
+
+#endif
