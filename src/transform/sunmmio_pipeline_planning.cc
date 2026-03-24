@@ -8,6 +8,7 @@
 #include "tvm/tir/function.h"
 #include "tvm/tir/stmt.h"
 #include <algorithm>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -261,6 +262,7 @@ public:
   std::vector<Device> devices;
 
   bool debug_{false};
+  int iter_mod_{-1};
   std::map<std::string, int> b_level;
   std::unordered_map<std::string, int> name_to_index_;
   std::unordered_map<int, std::string> index_to_name_;
@@ -268,6 +270,13 @@ public:
   std::vector<std::vector<int>> predecessors_;
   std::vector<std::vector<int>> successors_;
   std::vector<int> topo_order_;
+
+  int GetVersionId(const Command &cmd) const {
+    if (iter_mod_ > 0) {
+      return cmd.iter % iter_mod_;
+    }
+    return cmd.iter;
+  }
 
   Scheduler() {
     devices.push_back(Device(DeviceType::ODMA));
@@ -349,6 +358,7 @@ public:
     for (int ii = 0; ii < n; ++ii) {
       int curr_idx = topo_order_[ii];
       const Command &curr_cmd = commands[curr_idx];
+      int curr_ver = GetVersionId(curr_cmd);
 
       // Check dependencies based on Reads (RAW, WAW handled later by Writes)
       // Current command Reads from Buffer -> Find previous Writes (RAW)
@@ -361,7 +371,7 @@ public:
         // Iterate backwards to find the latest dependency
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
           if (versioned_buffers_.count(buf) &&
-              commands[it->cmd_idx].iter != curr_cmd.iter) {
+              GetVersionId(commands[it->cmd_idx]) != curr_ver) {
             continue;
           }
           if (it->type == kWrite &&
@@ -397,10 +407,7 @@ public:
         auto &history = buffer_access_history[buf];
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
           if (versioned_buffers_.count(buf) &&
-              commands[it->cmd_idx].iter != curr_cmd.iter) {
-            continue;
-          }
-          if (versioned_buffers_.count(buf) && it->type == kRead) {
+              GetVersionId(commands[it->cmd_idx]) != curr_ver) {
             continue;
           }
           if (RegionIntersect(write_region->region, it->region)) {
@@ -580,42 +587,89 @@ public:
               });
 
     auto insert_interval = [](std::vector<Interval> &v, Interval x) {
-      v.push_back(x);
-      std::sort(v.begin(), v.end(), [](const Interval &a, const Interval &b) {
-        return a.start < b.start;
-      });
+      auto pos = std::lower_bound(v.begin(), v.end(), x,
+                                  [](const Interval &a, const Interval &b) {
+                                    return a.start < b.start;
+                                  });
+      v.insert(pos, x);
     };
 
+    std::vector<int> prefetch_indices;
+    prefetch_indices.reserve(prefetch_queue.size());
     for (auto *cmd : prefetch_queue) {
-      float duration = cmd->get_delay();
+      auto it = name_to_index_.find(cmd->name);
+      ICHECK(it != name_to_index_.end());
+      prefetch_indices.push_back(it->second);
+    }
+
+    int n = static_cast<int>(commands.size());
+    std::vector<int> indegree(n, 0);
+    for (int idx : prefetch_indices) {
+      int deg = 0;
+      for (int pred : predecessors_[idx]) {
+        if (commands[pred].is_prefetch) {
+          deg += 1;
+        }
+      }
+      indegree[idx] = deg;
+    }
+
+    std::deque<int> ready_prefetch;
+    for (int idx : prefetch_indices) {
+      if (indegree[idx] == 0) {
+        ready_prefetch.push_back(idx);
+      }
+    }
+
+    int scheduled_prefetch = 0;
+    while (!ready_prefetch.empty()) {
+      int idx = ready_prefetch.front();
+      ready_prefetch.pop_front();
+      Command *cmd = &commands[idx];
 
       float ready_time = 0;
+      for (int pred : predecessors_[idx]) {
+        if (commands[pred].scheduled_end >= 0) {
+          ready_time = std::max(ready_time, commands[pred].scheduled_end);
+        }
+      }
 
+      float duration = cmd->get_delay();
       auto &v = busy[cmd->type];
       float t = ready_time;
-      bool placed = false;
       for (size_t i = 0; i <= v.size(); i++) {
-        float gap_start = t;
         float gap_end =
             (i < v.size()) ? v[i].start : std::numeric_limits<float>::max();
-        if (gap_end - gap_start >= duration) {
-          float start = gap_start;
-          float end = start + duration;
-          cmd->scheduled_start = start;
-          cmd->scheduled_end = end;
+        if (gap_end - t >= duration) {
+          cmd->scheduled_start = t;
+          cmd->scheduled_end = t + duration;
           cmd->finished = true;
-          insert_interval(v, {start, end});
+          insert_interval(v, {cmd->scheduled_start, cmd->scheduled_end});
           schedule.push_back(*cmd);
-          placed = true;
+          scheduled_prefetch += 1;
           break;
         }
         if (i < v.size()) {
           t = std::max(t, v[i].end);
         }
       }
-      if (!placed) {
+      if (!cmd->finished) {
         LOG(FATAL) << "Failed to insert prefetch command " << cmd->name;
       }
+
+      for (int succ : successors_[idx]) {
+        if (!commands[succ].is_prefetch) {
+          continue;
+        }
+        indegree[succ] -= 1;
+        if (indegree[succ] == 0) {
+          ready_prefetch.push_back(succ);
+        }
+      }
+    }
+
+    if (scheduled_prefetch != static_cast<int>(prefetch_indices.size())) {
+      LOG(FATAL) << "Cycle detected in prefetch dependency subgraph.";
     }
 
     std::sort(schedule.begin(), schedule.end(),
@@ -850,8 +904,13 @@ private:
       LOG(INFO) << versioned_buffers;
     }
 
+    Scheduler body_scheduler;
+    int iterations = body_scheduler.num_stages_to_iterations(num_stages);
+    body_scheduler.iter_mod_ = iterations;
+
     // 1.2 Build Prologue Commands
     Scheduler prologue_scheduler;
+    prologue_scheduler.iter_mod_ = iterations;
     std::vector<Command> prologue_commands;
     Array<String> prologue_orders;
     std::vector<int> prologue_ids;
@@ -865,8 +924,6 @@ private:
     }
 
     // 1.3 Build Body Commands
-    Scheduler body_scheduler;
-    int iterations = body_scheduler.num_stages_to_iterations(num_stages);
     for (int i = 0; i < iterations; i++) {
       for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
         if (std::find(prologue_ids.begin(), prologue_ids.end(), j) !=
@@ -898,6 +955,7 @@ private:
 
     // 1.4 Build Epilogue Commands
     Scheduler epilogue_scheduler;
+    epilogue_scheduler.iter_mod_ = iterations;
     PrimExpr epilogue_iterations_expr = floormod(loop->extent, iterations);
     int epilogue_iterations = -1;
     if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {

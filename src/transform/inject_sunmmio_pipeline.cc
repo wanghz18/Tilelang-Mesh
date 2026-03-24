@@ -9,6 +9,7 @@
 #include "common/ast_traverser.h"
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
+#include "common/sunmmio_pipeline_utils.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
 #include "tvm/node/structural_equal.h"
@@ -36,24 +37,6 @@ struct LetWrapper {
   PrimExpr value;
 };
 
-Block MakeBlock(const Stmt &body,
-                const Map<Var, Buffer> &buffer_data_to_buffer) {
-  if (const BlockRealizeNode *block_realize = body.as<BlockRealizeNode>()) {
-    if (is_one(block_realize->predicate)) {
-      // no need to create a new block
-      return block_realize->block;
-    }
-  }
-  Block block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-              /*body*/ body);
-  Array<Array<BufferRegion>> access =
-      GetBlockReadWriteRegion(block, buffer_data_to_buffer);
-  BlockNode *n = block.CopyOnWrite();
-  n->reads = access[0];
-  n->writes = access[1];
-  return block;
-}
-
 class MultiVersionBufferRewriter : public StmtExprMutator {
 public:
   MultiVersionBufferRewriter(const PrimFunc &f) {
@@ -69,7 +52,7 @@ public:
     substituter.VisitStmt(f->body);
     substituter.replace_flag = true;
 
-    for (auto &buffer : substituter.used_buffers_) {
+    for (auto &buffer : substituter.versioned_buffers_) {
       substituter.buffer_remap_.Set(
           buffer,
           substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
@@ -107,7 +90,7 @@ private:
     if (it != buffer_remap_.end()) {
       Region new_region = buffer_region->region;
       const Buffer &new_buffer = (*it).second;
-      Range accessed_version = Range::FromMinExtent(0, new_buffer->shape[0]);
+      Range accessed_version = Range::FromMinExtent(0, 1);
       new_region.insert(new_region.begin(), accessed_version);
       return BufferRegion(new_buffer, new_region);
     }
@@ -116,22 +99,40 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
-    if (!replace_flag) {
-      auto used_buffers_anno = op->annotations.Get("used_buffers");
-      auto iterations_anno = op->annotations.Get("iterations");
-      if (used_buffers_anno && iterations_anno) {
-        used_buffers_ = Downcast<Array<Buffer>>(used_buffers_anno.value());
-        iterations_ = Downcast<int>(iterations_anno.value());
+    auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
+    auto used_buffers_anno = op->annotations.Get("used_buffers");
+    auto iterations_anno = op->annotations.Get("iterations");
+    if (versioned_buffers_anno && used_buffers_anno && iterations_anno) {
+      Array<Buffer> versioned_buffers =
+          Downcast<Array<Buffer>>(versioned_buffers_anno.value());
+      int iterations = Downcast<int>(iterations_anno.value());
+      if (!replace_flag) {
+        versioned_buffers_ = versioned_buffers;
+        iterations_ = iterations;
+      } else {
+        Array<Buffer> new_versioned_buffers;
+        for (const Buffer &buffer : versioned_buffers) {
+          if (buffer_remap_.count(buffer)) {
+            new_versioned_buffers.push_back(buffer_remap_[buffer]);
+          } else {
+            new_versioned_buffers.push_back(buffer);
+          }
+        }
+        loop.CopyOnWrite()->annotations.Set("versioned_buffers",
+                                            new_versioned_buffers);
+        Array<Buffer> used_buffers =
+            Downcast<Array<Buffer>>(used_buffers_anno.value());
+        Array<Buffer> new_used_buffers;
+        for (const Buffer &buffer : used_buffers) {
+          if (buffer_remap_.count(buffer)) {
+            new_used_buffers.push_back(buffer_remap_[buffer]);
+          } else {
+            new_used_buffers.push_back(buffer);
+          }
+        }
+        loop.CopyOnWrite()->annotations.Set("used_buffers", new_used_buffers);
       }
-      return loop;
     }
-
-    Array<Buffer> remap_used_buffer;
-    for (auto &it : used_buffers_) {
-      remap_used_buffer.push_back(buffer_remap_[it]);
-    }
-    loop.CopyOnWrite()->annotations.Set("used_buffers", remap_used_buffer);
-
     return loop;
   }
 
@@ -258,7 +259,7 @@ private:
 
       Buffer new_buffer = buffer_remap_[original_buffer];
       Array<Range> new_ranges = original_region->GetRanges();
-      new_ranges.insert(new_ranges.begin(), Range(0, iterations_));
+      new_ranges.insert(new_ranges.begin(), Range(0, 1));
 
       Array<PrimExpr> new_args;
       new_args.push_back(BufferLoad(new_buffer, [new_ranges]() {
@@ -291,7 +292,7 @@ private:
     return std::move(var);
   }
 
-  Array<Buffer> used_buffers_;
+  Array<Buffer> versioned_buffers_;
   int iterations_ = -1;
   bool replace_flag = false;
   Map<Buffer, Buffer> buffer_remap_;
@@ -435,11 +436,16 @@ private:
   Stmt VisitStmt_(const ForNode *op) final {
     // Step 1: Recursively rewrite the children first.
     For for_node = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+
     auto iterations_anno = op->annotations.Get("iterations");
-    auto orders_anno = op->annotations.Get("orders");
-    auto remaining_orders_anno = op->annotations.Get("remaining_orders");
     auto used_buffers_anno = op->annotations.Get("used_buffers");
-    if (!iterations_anno || !orders_anno || !used_buffers_anno) {
+    auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
+    auto prologue_orders_anno = op->annotations.Get("prologue_orders");
+    auto body_orders_anno = op->annotations.Get("body_orders");
+    auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
+
+    if (!iterations_anno || !used_buffers_anno || !versioned_buffers_anno ||
+        !prologue_orders_anno || !body_orders_anno || !epilogue_orders_anno) {
       return for_node;
     }
 
@@ -531,77 +537,81 @@ private:
     ICHECK(pipeline_body_seq != nullptr);
 
     // Step 3: Rewrite the body of loop.
-    Array<Block> original_order; // pipeline body blocks in the original order
-
-    auto f_add_child = [&](const Stmt &child) {
-      original_order.push_back(MakeBlock(child, buffer_data_to_buffer_));
-    };
-
     int iterations = Downcast<IntImm>(iterations_anno.value())->value;
-    Array<String> orders = Downcast<Array<String>>(orders_anno.value());
+    Array<String> prologue_orders =
+        Downcast<Array<String>>(prologue_orders_anno.value());
+    Array<String> body_orders =
+        Downcast<Array<String>>(body_orders_anno.value());
+    Array<String> epilogue_orders =
+        Downcast<Array<String>>(epilogue_orders_anno.value());
+    Array<Buffer> versioned_buffers =
+        Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
         Downcast<Array<Buffer>>(used_buffers_anno.value());
     for (auto it : used_buffers) {
       pipeline_allocs.push_back(it);
     }
 
-    Array<Stmt> new_body;
-    // Step 3.1: Rewrite the for body of loop.
-    Array<Stmt> new_for_body;
-    auto rewriter = PipelineBodyRewriter(used_buffers, for_node);
-    for (const auto &order_str : orders) {
-      std::string s = order_str;
-      size_t dash_pos = s.find('-');
-      int iter = -1;
-      int id = -1;
-      if (dash_pos != std::string::npos) {
-        iter = std::stoi(s.substr(0, dash_pos));
-        id = std::stoi(s.substr(dash_pos + 1));
-      }
-      ICHECK(iter != -1 && id != -1)
-          << "Can't phrase id from order: " << order_str;
-
+    auto rewriter = PipelineBodyRewriter(versioned_buffers, for_node);
+    Array<Stmt> for_body;
+    // Step 3.1: Rewrite prologue
+    for (const auto &order_str : prologue_orders) {
+      int iter = name2iter(order_str);
+      int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
       rewriter.set_current_version(iter);
-      PrimExpr replaced_loop_var =
-          iterations * for_node->loop_var + iter + for_node->min;
+      PrimExpr replaced_loop_var = 0 + iter + for_node->min;
       rewriter.set_loop_var_replacement(replaced_loop_var);
       stmt = rewriter(stmt);
-      new_for_body.push_back(stmt);
+      for_body.push_back(stmt);
+    }
+
+    // Step 3.2: Rewrite the for body of loop.
+    Array<Stmt> body;
+    for (const auto &order_str : body_orders) {
+      int iter = name2iter(order_str);
+      PrimExpr replaced_loop_var =
+          iterations * for_node->loop_var + iter + for_node->min;
+      if (iter == iterations) {
+        iter = 0;
+      }
+      int id = name2id(order_str);
+      Stmt stmt = pipeline_body_seq->seq[id];
+      rewriter.set_current_version(iter);
+      rewriter.set_loop_var_replacement(replaced_loop_var);
+      stmt = rewriter(stmt);
+      body.push_back(stmt);
     }
 
     auto extent = floordiv(for_node->extent, iterations);
+    PrimExpr epilogue_iterations_expr = floormod(for_node->extent, iterations);
+    int epilogue_iterations = -1;
+    if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {
+      epilogue_iterations = mod_int->value;
+    }
+    ICHECK(epilogue_iterations != -1)
+        << "Can't calculate the epilogue iterations.";
+
+    if (epilogue_iterations == 0) {
+      extent = extent - 1;
+    }
     For new_for_stmt =
         For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial,
-            SeqStmt::Flatten(new_for_body), for_node->thread_binding, {});
-    new_body.push_back(new_for_stmt);
+            SeqStmt::Flatten(body), for_node->thread_binding, {});
+    for_body.push_back(new_for_stmt);
 
-    // Step 3.2 Rewrite the remaining statements
-    if (remaining_orders_anno) {
-      Array<String> remaining_orders =
-          Downcast<Array<String>>(remaining_orders_anno.value());
-      Array<Stmt> remaining;
-      for (const auto &order_str : remaining_orders) {
-        std::string s = order_str;
-        size_t dash_pos = s.find('-');
-        int iter = -1;
-        int id = -1;
-        if (dash_pos != std::string::npos) {
-          iter = std::stoi(s.substr(0, dash_pos));
-          id = std::stoi(s.substr(dash_pos + 1));
-        }
-        ICHECK(iter != -1 && id != -1)
-            << "Can't phrase id from order: " << order_str;
-
-        Stmt stmt = pipeline_body_seq->seq[id];
-        rewriter.set_current_version(iter);
-        PrimExpr replaced_loop_var = iterations * extent + iter + for_node->min;
-        rewriter.set_loop_var_replacement(replaced_loop_var);
-        stmt = rewriter(stmt);
-        new_body.push_back(stmt);
-      }
+    // Step 3.3: Rewrite the epilogue.
+    for (const auto &order_str : epilogue_orders) {
+      int iter = name2iter(order_str);
+      int id = name2id(order_str);
+      Stmt stmt = pipeline_body_seq->seq[id];
+      rewriter.set_current_version(iter);
+      PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
+      rewriter.set_loop_var_replacement(replaced_loop_var);
+      stmt = rewriter(stmt);
+      for_body.push_back(stmt);
     }
-    return SeqStmt::Flatten(new_body);
+    return SeqStmt::Flatten(for_body);
   }
 
   Map<Var, Buffer> buffer_data_to_buffer_;
