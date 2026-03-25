@@ -37,9 +37,9 @@ struct LetWrapper {
   PrimExpr value;
 };
 
-class MultiVersionBufferRewriter : public StmtExprMutator {
+class SunmmioMultiVersionBufferRewriter : public StmtExprMutator {
 public:
-  MultiVersionBufferRewriter(const PrimFunc &f) {
+  SunmmioMultiVersionBufferRewriter(const PrimFunc &f) {
     for (const auto &kv : f->buffer_map) {
       const Buffer &buffer = kv.second;
       buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -47,7 +47,7 @@ public:
   }
 
   static Stmt Substitute(PrimFunc &f) {
-    MultiVersionBufferRewriter substituter(f);
+    SunmmioMultiVersionBufferRewriter substituter(f);
     // collect used_buffers and iterations
     substituter.VisitStmt(f->body);
     substituter.replace_flag = true;
@@ -623,7 +623,7 @@ tvm::transform::Pass InjectSunmmioPipeline() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     auto *fptr = f.CopyOnWrite();
-    fptr->body = MultiVersionBufferRewriter::Substitute(f);
+    fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(f);
     fptr->body = SunmmioPipelineInjector::Inject(f);
     return f;
   };

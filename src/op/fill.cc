@@ -181,8 +181,6 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
     return unrolled_loop;
   } else if (IsSharedBuffer(dst) || IsGlobalBuffer(dst)) {
-    // TODO: duplicate
-    // just for test, will be replaced by zongzheng's implementation
     auto par_op = ParallelOp(MakeSIMTLoop(analyzer));
     par_op->InferLayout({T.target,
                          T.thread_bounds,
@@ -202,6 +200,8 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
     return unrolled_loop;
   } else if (dst.scope() == "shared.rsram") {
+    // TODO: duplicate
+    // just for test, will be replaced by zongzheng's implementation
     auto par_op = ParallelOp(MakeSIMTLoop(analyzer));
     par_op->InferLayout({T.target,
                          T.thread_bounds,
