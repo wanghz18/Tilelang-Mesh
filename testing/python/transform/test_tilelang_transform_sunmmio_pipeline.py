@@ -8,9 +8,6 @@ from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accum_dtype="float"):
-    tile_size = (8, 8)
-    index_map = (-2, -1)
-
     @T.prim_func
     def gemm(
         A: T.MeshTensor(
