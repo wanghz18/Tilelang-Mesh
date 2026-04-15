@@ -271,27 +271,6 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                         unrolled_loop);
     }
     return unrolled_loop;
-  } else if (dst.scope() == "shared.rsram") {
-    // TODO: duplicate
-    // just for test, will be replaced by zongzheng's implementation
-    auto par_op = ParallelOp(MakeSIMTLoop(analyzer));
-    par_op->InferLayout({T.target,
-                         T.thread_bounds,
-                         T.layout_map,
-                         analyzer,
-                         false,
-                         T.buffer_remap,
-                         {}},
-                        InferLevel::kFree);
-    auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
-                                     par_op->GetLoopLayout());
-    auto vectorized_loop = VectorizeLoop(thread_loop, analyzer, T.layout_map);
-    auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
-    if (par_op->GetPredicate(T.thread_var).defined()) {
-      return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
-                        unrolled_loop);
-    }
-    return unrolled_loop;
   } else {
     LOG(FATAL) << "Unsupported scope " << dst.scope();
     return Stmt();
