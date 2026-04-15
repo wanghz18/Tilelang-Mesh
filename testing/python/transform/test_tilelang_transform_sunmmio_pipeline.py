@@ -5,7 +5,6 @@ import tilelang.language as T
 from tilelang.engine.phase import *
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
-from tilelang.tileview import make_tileview
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accum_dtype="float"):
@@ -46,9 +45,6 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accu
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
-            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
-            T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
-            T.annotate_tileview({C_shared: make_tileview(C_shared, tile_size, index_map)})
             T.clear(C_shared)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(A[by * block_M, k * block_K], A_shared)
@@ -88,13 +84,6 @@ def flashattn(batch=1, heads=64, seq_len=4096, dim=128, is_causal=False, groups=
             scores_scale = T.alloc_shared([block_M], accum_dtype)
             scores_sum = T.alloc_shared([block_M], accum_dtype)
             logsum = T.alloc_shared([block_M], accum_dtype)
-
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
 
             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
             T.fill(acc_o, 0)
@@ -144,7 +133,7 @@ def flashattn(batch=1, heads=64, seq_len=4096, dim=128, is_causal=False, groups=
 
 
 # flash decoding gqa decode
-def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=128, block_H=64, num_split=1, num_stages=2, threads=1):
+def flashdecoding(batch=1, heads=256, groups=8, seqlen_kv=8192, dim=128, block_N=128, block_H=64, num_split=1, num_stages=2, threads=1):
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
     shape_k = [batch, seqlen_kv, groups, dim]
@@ -183,13 +172,6 @@ def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=
             scores_scale = T.alloc_shared([block_H], accum_dtype)
             scores_sum = T.alloc_shared([block_H], accum_dtype)
             logsum = T.alloc_shared([block_H], accum_dtype)
-
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
 
             bid = bx
             hid = by
@@ -260,7 +242,7 @@ def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=
             #         glse[bid, hid * valid_block_H + i, sid] = logsum[i]
             # # T.copy(acc_o[:valid_block_H, :], O_shared)
             # T.copy(acc_o, O_shared)
-            # T.copy(O_shared, Output_partial[bid, hid * valid_block_H : (hid + 1) * valid_block_H, sid, :])
+            T.copy(O_shared, Output_partial[bid, hid * valid_block_H : (hid + 1) * valid_block_H, sid, :])
 
         # combine
         # with T.Kernel(heads, batch, threads=128) as (by, bz):
@@ -273,7 +255,7 @@ def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=
 
         #     T.clear(lse_logsum_local)
         #     T.clear(o_accum_local)
-        #     for k, j in T.Tiles(num_split, 128):
+        #     for k, j in T.Tiles(lse_local, parallel=True):
         #         lse_local[k, j] = glse[bz, by, k]
         #     T.reduce_max(lse_local, lse_max_local, dim=0, clear=True)
         #     for k in T.serial(num_split):
@@ -317,12 +299,6 @@ def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=
             scores_sum = T.alloc_shared([block_H], accum_dtype)
             logsum = T.alloc_shared([block_H], accum_dtype)
 
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
             bid = bx
             hid = by
             cur_kv_head = hid // (kv_group_num // valid_block_H)
@@ -362,7 +338,7 @@ def flashdecoding(batch=1, heads=32, groups=8, seqlen_kv=8192, dim=128, block_N=
             for i in T.Tiles(logsum, parallel=True):
                 logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
             # T.copy(acc_o[:valid_block_H, :], O_shared)
-            # T.copy(O_shared, Output[bid, hid * valid_block_H : (hid + 1) * valid_block_H, :])
+            T.copy(O_shared, Output[bid, hid * valid_block_H : (hid + 1) * valid_block_H, :])
 
     if num_split > 1:
         return flashattn_gqa_decode_split
@@ -417,13 +393,6 @@ def flashmladecode(
             scores_scale = T.alloc_shared([block_H], accum_dtype)
             scores_sum = T.alloc_shared([block_H], accum_dtype)
             logsum = T.alloc_shared([block_H], accum_dtype)
-
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
 
             cur_kv_head = hid // (kv_group_num // block_H)
             T.use_swizzle(10)
@@ -523,13 +492,6 @@ def flashmladecode(
 
             cur_kv_head = hid // (kv_group_num // block_H)
 
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
-
             T.copy(Q[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_shared)
             T.copy(Q_pe[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_pe_shared)
             T.fill(acc_o, 0)
@@ -621,13 +583,6 @@ def native_sparse_attention(
             scores_sum = T.alloc_shared([G], accum_dtype)
             logsum = T.alloc_shared([G], accum_dtype)
 
-            T.annotate_tileview({acc_s: make_tileview(acc_s, (32, 32), (0, 1))})
-            T.annotate_tileview({scores_max: make_tileview(scores_max, (32,), (0,))})
-            T.annotate_tileview({scores_max_prev: make_tileview(scores_max_prev, (32,), (0,))})
-            T.annotate_tileview({scores_sum: make_tileview(scores_sum, (32,), (0,))})
-            T.annotate_tileview({scores_scale: make_tileview(scores_scale, (32,), (0,))})
-            T.annotate_tileview({logsum: make_tileview(logsum, (32,), (0,))})
-
             i_t, i_v, i_bh = bx, by, bz
             i_b, i_h = i_bh // head_kv, i_bh % head_kv
 
@@ -685,11 +640,11 @@ CASES = [
     # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=2),
     # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
     # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=4),
-    lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=5),
-    lambda: flashattn(num_stages=3),
+    # lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=5),
+    # lambda: flashattn(num_stages=3),
     lambda: flashdecoding(num_stages=3),
-    lambda: flashmladecode(num_stages=5),
-    lambda: native_sparse_attention(num_stages=5),
+    # lambda: flashmladecode(num_stages=5),
+    # lambda: native_sparse_attention(num_stages=5),
 ]
 
 
