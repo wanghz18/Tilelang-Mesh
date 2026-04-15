@@ -2,11 +2,13 @@
 #include "common/ast_traverser.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
+#include "tvm/runtime/data_type.h"
 #include "tvm/runtime/logging.h"
 #include "tvm/tir/buffer.h"
 #include "tvm/tir/expr.h"
 #include "tvm/tir/function.h"
 #include "tvm/tir/stmt.h"
+#include "tvm/tir/var.h"
 #include <algorithm>
 #include <deque>
 #include <fstream>
@@ -32,7 +34,9 @@ namespace tl {
 
 using namespace tir;
 
-bool RegionIntersect(const Region &region1, const Region &region2) {
+int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+bool PipelineRegionIntersect(const Region &region1, const Region &region2) {
   ICHECK(region1.size() == region2.size());
   for (size_t i = 0; i < region1.size(); i++) {
     Range dim1 = region1[i];
@@ -143,6 +147,217 @@ private:
   ASTTraverser traverser_;
 };
 
+class SunmmioExprAnalyzer : public StmtExprVisitor {
+public:
+  SunmmioExprAnalyzer() {}
+
+  void Analyze(const PrimExpr &expr) {
+    loop_cost_ = 0;
+    load_times = 0;
+    flops_ = 0;
+    args_.clear();
+    constants_.clear();
+    vars_.clear();
+    StmtExprVisitor::VisitExpr(expr);
+  }
+
+private:
+  void VisitExpr_(const MulNode *op) final {
+    auto a = op->a;
+    auto b = op->b;
+    flops_ += 1;
+    if (const auto *a_int = a.as<IntImmNode>()) {
+      if (const auto *b_int = b.as<IntImmNode>()) {
+        return;
+      } else {
+        if (a_int->value <= 32) {
+          loop_cost_ += 2;
+          StmtExprVisitor::VisitExpr(op->b);
+          return;
+        }
+      }
+    }
+
+    if (const auto *b_int = b.as<IntImmNode>()) {
+      if (b_int->value <= 32) {
+        loop_cost_ += 2;
+        StmtExprVisitor::VisitExpr(op->a);
+        return;
+      }
+    }
+
+    loop_cost_ += 4;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const SubNode *op) final {
+    loop_cost_ += 4;
+    flops_ += 1;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const AddNode *op) final {
+    loop_cost_ += 4;
+    flops_ += 1;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const MaxNode *op) final {
+    loop_cost_ += 3;
+    flops_ += 1;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const MinNode *op) final {
+    loop_cost_ += 3;
+    flops_ += 1;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const CastNode *op) final {
+    loop_cost_ += 3;
+    StmtExprVisitor::VisitExpr(op->value);
+  }
+
+  void VisitExpr_(const IntImmNode *op) final {
+    bool insert = true;
+    for (auto it : constants_) {
+      if (ExprDeepEqual()(it, tvm::ffi::GetRef<PrimExpr>(op))) {
+        insert = false;
+        break;
+      }
+    }
+    if (insert) {
+      constants_.push_back(tvm::ffi::GetRef<PrimExpr>(op));
+    }
+  }
+
+  void VisitExpr_(const FloatImmNode *op) final {
+    bool insert = true;
+    for (auto it : constants_) {
+      if (ExprDeepEqual()(it, tvm::ffi::GetRef<PrimExpr>(op))) {
+        insert = false;
+        break;
+      }
+    }
+    if (insert) {
+      constants_.push_back(tvm::ffi::GetRef<PrimExpr>(op));
+    }
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    bool insert = true;
+    for (auto it : vars_) {
+      if (ExprDeepEqual()(it, tvm::ffi::GetRef<PrimExpr>(op))) {
+        insert = false;
+        break;
+      }
+    }
+    if (insert) {
+      vars_.push_back(tvm::ffi::GetRef<PrimExpr>(op));
+    }
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(Op::Get("tir.exp2"))) {
+      loop_cost_ += 10;
+      flops_ += 3;
+      StmtExprVisitor::VisitExpr(op->args[0]);
+    } else if (op->op.same_as(Op::Get("tl.infinity"))) {
+      // should use data type here
+      // TODO: check data type of infinity constant
+      bool insert = true;
+      for (auto it : constants_) {
+        if (ExprDeepEqual()(it,
+                            FloatImm(DataType::Float(16),
+                                     std::numeric_limits<float>::infinity()))) {
+          insert = false;
+          break;
+        }
+      }
+      if (insert) {
+        constants_.push_back(FloatImm(DataType::Float(16),
+                                      std::numeric_limits<float>::infinity()));
+      }
+    } else if (op->op.same_as(Op::Get("tir.if_then_else"))) {
+      bool insert = true;
+      for (auto it : args_) {
+        if (ExprDeepEqual()(it, op->args[0])) {
+          insert = false;
+          break;
+        }
+      }
+      if (insert) {
+        args_.push_back(op->args[0]);
+      }
+      StmtExprVisitor::VisitExpr(op->args[0]);
+      StmtExprVisitor::VisitExpr(op->args[1]);
+      StmtExprVisitor::VisitExpr(op->args[2]);
+    } else if (op->op.same_as(Op::Get("tir.bitwise_and"))) {
+      bool insert = true;
+      for (auto it : args_) {
+        if (ExprDeepEqual()(it, op->args[0])) {
+          insert = false;
+          break;
+        }
+      }
+      if (insert) {
+        args_.push_back(op->args[0]);
+      }
+      flops_ += 1;
+      StmtExprVisitor::VisitExpr(op->args[0]);
+      StmtExprVisitor::VisitExpr(op->args[1]);
+    } else {
+      ICHECK(0) << "Op " << op->op << " not supported now.";
+    }
+  }
+
+  void VisitExpr_(const LENode *op) final {
+    loop_cost_ += 3;
+    flops_ += 1;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+
+    if (load_times == 0) {
+      load_times++;
+      loop_cost_ += 14;
+      flops_ += 5;
+    } else {
+      load_times++;
+      loop_cost_ += 1;
+      flops_ += 1;
+    }
+    for (auto arg : op->indices) {
+      bool insert = true;
+      for (auto it : args_) {
+        if (ExprDeepEqual()(it, arg)) {
+          insert = false;
+          break;
+        }
+      }
+      if (insert) {
+        args_.push_back(arg);
+      }
+    }
+  }
+
+public:
+  float loop_cost_ = 0;
+  Array<PrimExpr> args_;
+  Array<PrimExpr> vars_;
+  Array<PrimExpr> constants_;
+  int load_times = 0;
+  float flops_ = 0;
+};
+
 class Command {
 public:
   int id = -1;
@@ -199,15 +414,362 @@ public:
   }
 
   float get_delay() const {
-    // TODO
-    if (type == DeviceType::TensorCore)
-      return 10;
-    else if (type == DeviceType::ODMA)
-      return 3;
-    else if (type == DeviceType::VectorCore)
-      return 2;
+    if (type == DeviceType::TensorCore) {
+      if (const auto *block = stmt.as<BlockRealizeNode>()) {
+        auto body = block->block->body;
+        if (const auto *eval = body.as<EvaluateNode>()) {
+          if (const auto *call = eval->value.as<CallNode>()) {
+            if (call->op.same_as(Op::Get("tl.mma_sunmmio"))) {
+              // just for float16 now
 
-    return 1;
+              auto A = call->args[0].as<CallNode>();
+              auto B = call->args[1].as<CallNode>();
+              auto C = call->args[2].as<CallNode>();
+              DataType input_dtype = A->args[0]->dtype;
+              auto row_size = A->args[2].as<IntImmNode>()->value;
+              auto col_size = B->args[3].as<IntImmNode>()->value;
+              auto acc_size = A->args[3].as<IntImmNode>()->value;
+
+              int min_blk_num = 0;
+              if (row_size <= 16 && col_size <= 32) {
+                min_blk_num = 1;
+              } else {
+                min_blk_num = 4;
+              }
+              int gap = std::max(ceil_div(acc_size, 32), min_blk_num);
+
+              float delay =
+                  11 + 5 + 5 + 8 +
+                  ceil_div(row_size, 16) * ceil_div(col_size, 32) * gap + 70;
+              return delay;
+            }
+          }
+        }
+      }
+      ICHECK(0) << "Can't identify delay for command " << stmt;
+    } else if (type == DeviceType::ODMA) {
+      if (const auto *eval = stmt.as<EvaluateNode>()) {
+        if (const auto *call = eval->value.as<CallNode>()) {
+          if (call->op.same_as(Op::Get("tl.dma_copy"))) {
+            // LOG(INFO) << call->args;
+            auto src = call->args[0].as<CallNode>();
+            auto dtype = src->args[0]->dtype;
+            auto nums = 1;
+            for (int i = 2; i < src->args.size(); i++) {
+              nums *= src->args[i].as<IntImmNode>()->value;
+            }
+            auto num_kb = ceil_div(nums, 512);
+            float delay = 50 + num_kb;
+            // LOG(INFO) << "copy delay: " << delay;
+            return delay;
+          }
+        }
+      }
+      ICHECK(0) << "Can't identify delay for command " << stmt;
+    } else if (type == DeviceType::VectorCore) {
+      float flops_cost = 0;
+      if (const auto *for_node = stmt.as<ForNode>()) {
+        PrimExpr extent = for_node->extent;
+        float single_command_delay = 0;
+        auto current = for_node;
+
+        while (current->body.as<ForNode>()) {
+          current = current->body.as<ForNode>();
+          extent *= current->extent;
+        }
+
+        if (const auto *store = current->body.as<BufferStoreNode>()) {
+          auto buffer = store->buffer;
+          single_command_delay += 14;
+          auto indices = store->indices;
+          auto value = store->value;
+          SunmmioExprAnalyzer analyzer;
+          analyzer.Analyze(value);
+          flops_cost +=
+              (5 + analyzer.flops_) * (extent.as<IntImmNode>()->value);
+          single_command_delay += analyzer.loop_cost_;
+          int iterations =
+              ceil_div((extent.as<IntImmNode>()->value) * 16, 4096);
+          float total_cost = single_command_delay * iterations;
+          for (auto &it : analyzer.constants_) {
+            total_cost += 3;
+            flops_cost += 1;
+          }
+          auto args = analyzer.args_;
+          Array<PrimExpr> index_vars;
+          for (auto &it : args) {
+            index_vars.push_back(it);
+          }
+          for (auto &it : store->indices) {
+            bool insert = true;
+            for (auto &var : index_vars) {
+              if (ExprDeepEqual()(var, it)) {
+                insert = false;
+                break;
+              }
+            }
+            if (insert) {
+              index_vars.push_back(it);
+            }
+          }
+          for (auto &it : index_vars) {
+            analyzer.Analyze(it);
+            for (auto &var : analyzer.vars_) {
+              total_cost += 3 * iterations;
+            }
+            total_cost += analyzer.loop_cost_ * iterations;
+            flops_cost += analyzer.flops_ * (extent.as<IntImmNode>()->value);
+          }
+          flops_cost = ceil_div(flops_cost, 250);
+          // LOG(INFO) << "total cost:" << total_cost;
+          // LOG(INFO) << "flops cost:" << flops_cost;
+          return flops_cost;
+          return total_cost;
+        } else {
+          ICHECK(0) << "A command on VectorCore should be a BufferStoreNode "
+                       "within For Loops.";
+        }
+      } else if (const auto *block_node = stmt.as<BlockNode>()) {
+        auto body = block_node->body;
+        if (const auto *for_node = body.as<ForNode>()) {
+          PrimExpr out_extent = 1;
+          auto current = for_node;
+          auto previous = current;
+          while (current->body.as<ForNode>()) {
+            out_extent *= current->extent;
+            previous = current;
+            current = current->body.as<ForNode>();
+          }
+          float out_loop_single_cost = 0;
+          if (const auto seq = current->body.as<SeqStmtNode>()) {
+            ICHECK(seq->seq.size() == 3) << "Error format of reduce op";
+            // init of reduce
+            if (const auto if_stmt = seq->seq[0].as<IfThenElseNode>()) {
+              auto then_stmt = if_stmt->then_case;
+              PrimExpr init_extent = 1;
+              int init_iters = 0;
+              while (const auto init_for = then_stmt.as<ForNode>()) {
+                init_extent *= init_for->extent;
+                init_iters += 1;
+                then_stmt = init_for->body;
+              }
+              float init_cost =
+                  ceil_div(init_extent.as<IntImmNode>()->value * 16, 4096) *
+                      (14 + 3 * init_iters) +
+                  3;
+              out_loop_single_cost += init_cost;
+              flops_cost += (5 + 1) * init_extent.as<IntImmNode>()->value;
+            } else if (const auto init_for = seq->seq[0].as<ForNode>()) {
+              auto current_init_for = init_for;
+              PrimExpr init_extent = current_init_for->extent;
+              int init_iters = 1;
+              while (current_init_for->body.as<ForNode>()) {
+                current_init_for = current_init_for->body.as<ForNode>();
+                init_extent *= current_init_for->extent;
+                init_iters += 1;
+              }
+              float init_cost =
+                  ceil_div(init_extent.as<IntImmNode>()->value * 16, 4096) *
+                      (14 + 3 * init_iters) +
+                  3;
+              out_loop_single_cost += init_cost;
+              flops_cost += (5 + 1) * init_extent.as<IntImmNode>()->value;
+            } else {
+              ICHECK(0) << "Error format of reduce op";
+            }
+
+            // end of reduce
+            if (const auto if_stmt = seq->seq[2].as<IfThenElseNode>()) {
+              auto then_stmt = if_stmt->then_case;
+              float end_cost = 0;
+              if (const auto end_seq = then_stmt.as<SeqStmtNode>()) {
+                ICHECK(end_seq->seq[0].as<EvaluateNode>())
+                    << "Error format of reduce op";
+                auto node = end_seq->seq[0].as<EvaluateNode>();
+                ICHECK(node->value.as<CallNode>())
+                    << "Error format of reduce op";
+                auto reduce = node->value.as<CallNode>();
+                if (reduce->args[0].as<StringImmNode>()->value == "max" ||
+                    reduce->args[0].as<StringImmNode>()->value == "min") {
+                  end_cost += 4;
+                  flops_cost += 1;
+                } else if (reduce->args[0].as<StringImmNode>()->value ==
+                           "sum") {
+                  end_cost += 9;
+                  flops_cost += 3;
+                } else {
+                  ICHECK(0)
+                      << "Not implemented now for reduce " << reduce->args[0];
+                }
+                ICHECK(end_seq->seq[1].as<ForNode>())
+                    << "Error format of reduce op";
+                PrimExpr end_extent = 1;
+                auto end_loop = end_seq->seq[1];
+                while (end_loop.as<ForNode>()) {
+                  end_extent *= end_loop.as<ForNode>()->extent;
+                  end_loop = end_loop.as<ForNode>()->body;
+                }
+                ICHECK(end_loop.as<BufferStoreNode>())
+                    << "Error format of reduce op";
+                auto store = end_loop.as<BufferStoreNode>();
+                SunmmioExprAnalyzer analyzer;
+                analyzer.Analyze(store->value);
+                int iterations =
+                    ceil_div(end_extent.as<IntImmNode>()->value * 16, 4096);
+                float end_cost = (analyzer.loop_cost_ + 14) * iterations;
+                flops_cost +=
+                    (5 + analyzer.flops_) * end_extent.as<IntImmNode>()->value;
+                // for
+                for (auto &it : analyzer.constants_) {
+                  end_cost += 3;
+                  flops_cost += 1;
+                }
+                auto args = analyzer.args_;
+                Array<PrimExpr> index_vars;
+                for (auto &it : args) {
+                  index_vars.push_back(it);
+                }
+                for (auto &it : store->indices) {
+                  bool insert = true;
+                  for (auto &var : index_vars) {
+                    if (ExprDeepEqual()(var, it)) {
+                      insert = false;
+                      break;
+                    }
+                  }
+                  if (insert) {
+                    index_vars.push_back(it);
+                  }
+                }
+                for (auto &it : index_vars) {
+                  analyzer.Analyze(it);
+                  for (auto &var : analyzer.vars_) {
+                    end_cost += 3 * iterations;
+                  }
+                  end_cost += analyzer.loop_cost_ * iterations;
+                  flops_cost +=
+                      analyzer.flops_ * end_extent.as<IntImmNode>()->value;
+                }
+                out_loop_single_cost += end_cost;
+              } else if (const auto eval = then_stmt.as<EvaluateNode>()) {
+                auto node = eval;
+                ICHECK(node->value.as<CallNode>())
+                    << "Error format of reduce op";
+                auto reduce = node->value.as<CallNode>();
+                if (reduce->args[0].as<StringImmNode>()->value == "max" ||
+                    reduce->args[0].as<StringImmNode>()->value == "min") {
+                  end_cost += 4;
+                  flops_cost += 1;
+                } else if (reduce->args[0].as<StringImmNode>()->value ==
+                           "sum") {
+                  end_cost += 9;
+                  flops_cost += 3;
+                } else {
+                  ICHECK(0)
+                      << "Not implemented now for reduce " << reduce->args[0];
+                }
+                out_loop_single_cost += end_cost;
+              } else {
+                ICHECK(0) << "Error format of reduce op";
+              }
+            } else if (const auto eval_stmt = seq->seq[2].as<EvaluateNode>()) {
+              float end_cost = 0;
+              auto node = eval_stmt;
+              ICHECK(node->value.as<CallNode>()) << "Error format of reduce op";
+              auto reduce = node->value.as<CallNode>();
+              if (reduce->args[0].as<StringImmNode>()->value == "max" ||
+                  reduce->args[0].as<StringImmNode>()->value == "min") {
+                end_cost += 4;
+                flops_cost += 1;
+              } else if (reduce->args[0].as<StringImmNode>()->value == "sum") {
+                end_cost += 9;
+                flops_cost += 3;
+              } else {
+                ICHECK(0) << "Not implemented now for reduce "
+                          << reduce->args[0];
+              }
+              out_loop_single_cost += end_cost;
+            } else {
+              ICHECK(0) << "Error format of reduce op";
+            }
+
+            // body of reduce
+            if (const auto for_stmt = seq->seq[1].as<ForNode>()) {
+              auto inner_for = seq->seq[1];
+              PrimExpr inner_extent = 1;
+              while (inner_for.as<ForNode>()) {
+                inner_extent *= inner_for.as<ForNode>()->extent;
+                inner_for = inner_for.as<ForNode>()->body;
+              }
+              ICHECK(inner_for.as<BufferStoreNode>())
+                  << "Error format of reduce op";
+              auto store = inner_for.as<BufferStoreNode>();
+              SunmmioExprAnalyzer analyzer;
+              analyzer.Analyze(store->value);
+              int iterations = ceil_div(
+                  (inner_extent * previous->extent).as<IntImmNode>()->value *
+                      16,
+                  4096);
+              float body_cost = (14 + analyzer.loop_cost_) * iterations;
+              flops_cost +=
+                  (5 + analyzer.flops_) *
+                  (inner_extent * previous->extent).as<IntImmNode>()->value;
+              for (auto &it : analyzer.constants_) {
+                body_cost += 3;
+                flops_cost += 1;
+              }
+              auto args = analyzer.args_;
+              Array<PrimExpr> index_vars;
+              for (auto &it : args) {
+                index_vars.push_back(it);
+              }
+              for (auto &it : store->indices) {
+                bool insert = true;
+                for (auto &var : index_vars) {
+                  if (ExprDeepEqual()(var, it)) {
+                    insert = false;
+                    break;
+                  }
+                }
+                if (insert) {
+                  index_vars.push_back(it);
+                }
+              }
+              for (auto &it : index_vars) {
+                analyzer.Analyze(it);
+                for (auto &var : analyzer.vars_) {
+                  body_cost += 3 * iterations;
+                }
+                body_cost += analyzer.loop_cost_ * iterations;
+                flops_cost +=
+                    analyzer.flops_ *
+                    (inner_extent * previous->extent).as<IntImmNode>()->value;
+              }
+              out_loop_single_cost +=
+                  body_cost * previous->extent.as<IntImmNode>()->value;
+            } else {
+              ICHECK(0)
+                  << "A reduce command on VectorCore should be a SeqStmtNode "
+                     "within For Loops.";
+            }
+          } else {
+            ICHECK(0) << "A reduce command on VectorCore should be a ForNode "
+                         "within Block.";
+          }
+          flops_cost =
+              ceil_div(flops_cost * out_extent.as<IntImmNode>()->value, 250);
+          // LOG(INFO) << "flops cost: " << flops_cost;
+          // LOG(INFO) << "total cost: "
+          //           << out_loop_single_cost *
+          //                  out_extent.as<IntImmNode>()->value;
+          return flops_cost;
+          // return out_loop_single_cost * out_extent.as<IntImmNode>()->value;
+        } else {
+          ICHECK(0) << "Unsupported VectorCore command " << stmt;
+        }
+      }
+    }
+    ICHECK(0) << "Unsupported command type for " << stmt << " on " << int(type);
   }
 
   void get_command_reads_writes(std::set<BufferRegion> &read_buffer_regions_,
@@ -375,7 +937,7 @@ public:
             continue;
           }
           if (it->type == kWrite &&
-              RegionIntersect(read_region->region, it->region)) {
+              PipelineRegionIntersect(read_region->region, it->region)) {
             // Found a RAW dependency: it->cmd_idx -> curr_idx
             bool exists = false;
             for (int pred : predecessors_[curr_idx]) {
@@ -388,9 +950,9 @@ public:
               predecessors_[curr_idx].push_back(it->cmd_idx);
               successors_[it->cmd_idx].push_back(curr_idx);
             }
-            // Since we found the latest write that covers/intersects this read,
-            // we can stop searching backwards for this specific buffer region
-            // interaction assuming total ordering of writes.
+            // Since we found the latest write that covers/intersects this
+            // read, we can stop searching backwards for this specific buffer
+            // region interaction assuming total ordering of writes.
             break;
           }
         }
@@ -410,7 +972,7 @@ public:
               GetVersionId(commands[it->cmd_idx]) != curr_ver) {
             continue;
           }
-          if (RegionIntersect(write_region->region, it->region)) {
+          if (PipelineRegionIntersect(write_region->region, it->region)) {
             // Dependency: it->cmd_idx -> curr_idx
             bool exists = false;
             for (int pred : predecessors_[curr_idx]) {
@@ -533,10 +1095,10 @@ public:
             if (device.type == command->type && !device.busy) {
               device.assign_command(command, time);
               if (debug_) {
-                LOG(INFO) << "Command " << command->name
-                          << " assigned to device " << int(device.type)
-                          << " at time " << time << " with delay "
-                          << command->get_delay();
+                // LOG(INFO) << "Command " << command->name
+                //           << " assigned to device " << int(device.type)
+                //           << " at time " << time << " with delay "
+                //           << command->get_delay();
               }
               schedule.push_back(*command);
               break;
@@ -685,6 +1247,26 @@ public:
                  << int(cmd.type) << " " << cmd.scheduled_start << " "
                  << cmd.get_delay() << '\n';
       }
+      // if (log_file_name == "body.log") {
+      //   std::ofstream command_info;
+      //   command_info.open("command_info.log", std::ios::out);
+      //   float all_time = 0;
+      //   for (const auto &cmd : schedule) {
+      //     all_time = std::max(all_time, cmd.scheduled_start +
+      //     cmd.get_delay()); command_info << cmd.name << '\n'; for (auto &read
+      //     : cmd.reads) {
+      //       if (!IsGlobalBuffer(read->buffer))
+      //         command_info << read << ';';
+      //     }
+      //     command_info << '\n';
+      //     for (auto &write : cmd.writes) {
+      //       command_info << write << ';';
+      //     }
+      //     command_info << '\n';
+      //   }
+
+      //   LOG(INFO) << "Total time: " << all_time;
+      // }
     }
     return schedule;
   }
@@ -733,7 +1315,8 @@ private:
         }
         if (const auto *if_then_else = current.as<IfThenElseNode>()) {
           ICHECK(!if_then_else->else_case.defined())
-              << "Pipeline_Planning: Can't handle the body of the loop because "
+              << "Pipeline_Planning: Can't handle the body of the loop "
+                 "because "
                  "the IfThenElse node has an else branch";
           current = if_then_else->then_case;
           continue;
@@ -760,6 +1343,8 @@ private:
 
     // Use SunmmioRoleMarker to determine roles
     SunmmioRoleMarker role_marker(traverser);
+
+    float single = 0;
 
     for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
       auto stmt = pipeline_body_seq->seq[j];
@@ -788,7 +1373,9 @@ private:
           Array<BufferRegion>(traverser.write_buffer_regions_.begin(),
                               traverser.write_buffer_regions_.end()));
       iter0_commands.push_back(cmd);
+      single += cmd.get_delay();
     }
+    // LOG(INFO) << single * loop->extent;
 
     std::unordered_set<const BufferNode *> consumer_used, producer_used;
     std::unordered_map<const BufferNode *, size_t> first_write_index;
@@ -853,6 +1440,10 @@ private:
     for (const Buffer &buffer : used_buffers) {
       if (consumer_used.count(buffer.get()) &&
           producer_used.count(buffer.get())) {
+        auto r = first_read_index.find(buffer.get());
+        auto w = first_write_index.find(buffer.get());
+        if (r->second <= w->second)
+          continue;
         versioned_buffers.push_back(buffer);
         continue;
       }
@@ -892,6 +1483,11 @@ private:
           if (!can_propogate) {
             break;
           }
+        }
+        auto w = first_write_index.find(buffer.get());
+        auto r = first_read_index.find(buffer.get());
+        if (w->second >= r->second) {
+          can_propogate = false;
         }
         if (can_propogate) {
           versioned_buffers.push_back(buffer);
@@ -941,7 +1537,8 @@ private:
 
       for (auto &command : prologue_commands) {
         Command cmd(command.id, i + 1, command.stmt);
-        // prologue of next iteration doesn't participate in pipeline scheduling
+        // prologue of next iteration doesn't participate in pipeline
+        // scheduling
         if (i == iterations - 1) {
           cmd.is_prefetch = true;
         }
@@ -1009,22 +1606,12 @@ private:
     body_scheduler.CalculateBottomLevels();
     if (debug_) {
       body_scheduler.DumpGraph("body_graph.log");
-      LOG(INFO) << "Body Bottom Level:";
-      for (auto &it : body_scheduler.b_level) {
-        LOG(INFO) << it.first << ' ' << it.second;
-      }
     }
 
     epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
     epilogue_scheduler.debug_ = debug_;
     epilogue_scheduler.BuildDependencyGraph();
     epilogue_scheduler.CalculateBottomLevels();
-    if (debug_) {
-      LOG(INFO) << "Epilogue Bottom Level:";
-      for (auto &it : epilogue_scheduler.b_level) {
-        LOG(INFO) << it.first << ' ' << it.second;
-      }
-    }
 
     // 2. Do critical path pipeline
     auto prologue_result =
@@ -1032,6 +1619,32 @@ private:
     auto body_result = body_scheduler.CriticalPathPipeline("body.log");
     auto epilogue_result =
         epilogue_scheduler.CriticalPathPipeline("epilogue.log");
+
+    // int prologue_time = 0;
+    // for (const auto &cmd : prologue_result) {
+    //   prologue_time =
+    //       std::max(prologue_time, int(cmd.scheduled_start +
+    //       cmd.get_delay()));
+    // }
+    // int body_time = 0;
+    // for (const auto &cmd : body_result) {
+    //   body_time =
+    //       std::max(body_time, int(cmd.scheduled_start + cmd.get_delay()));
+    // }
+    // int epilogue_time = 0;
+    // for (const auto &cmd : epilogue_result) {
+    //   epilogue_time =
+    //       std::max(epilogue_time, int(cmd.scheduled_start +
+    //       cmd.get_delay()));
+    // }
+    // int new_extent = floordiv(loop->extent,
+    // iterations).as<IntImmNode>()->value; if (epilogue_iterations ==
+    // iterations) {
+    //   new_extent -= 1;
+    // }
+    // int all_time = prologue_time + body_time * new_extent + epilogue_time;
+    // LOG(INFO) << prologue_time << ' ' << body_time << ' ' << epilogue_time
+    //           << ' ' << new_extent << ' ' << all_time;
 
     // Finally, make the pipeline annotation
     Map<String, Any> annotations;
