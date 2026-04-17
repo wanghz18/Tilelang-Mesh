@@ -15,6 +15,7 @@
 #include <deque>
 #include <memory>
 #include <queue>
+#include <unordered_map>
 
 #include "../layout/utils.h"
 #include "../op/builtin.h"
@@ -35,7 +36,11 @@
 #include "loop_vectorize.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
+#include "tvm/runtime/data_type.h"
+#include "tvm/runtime/logging.h"
 #include "tvm/tir/buffer.h"
 #include "tvm/tir/stmt.h"
 #include "tvm/tir/var.h"
@@ -44,6 +49,16 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+Buffer makeNewBufferWithScope(const Buffer &buffer, std::string scope) {
+  const auto *ptr_type =
+      TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+  Type new_type = PointerType(ptr_type->element_type, scope);
+  Var new_var = Var(buffer->data->name_hint, new_type);
+  return Buffer(new_var, buffer->dtype, buffer->shape, {}, buffer->elem_offset,
+                buffer->name, buffer->data_alignment, buffer->offset_factor,
+                buffer->buffer_type);
+}
 
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
@@ -137,6 +152,14 @@ private:
     // do block->alloc_buffers remap
     Array<Buffer> alloc_buffers = block->alloc_buffers;
 
+    for (auto it : buffer_remap_) {
+      bool exists = std::find(alloc_buffers.begin(), alloc_buffers.end(),
+                              it.first) != alloc_buffers.end();
+      if (!exists) {
+        alloc_buffers.push_back(it.first);
+      }
+    }
+
     // remove the buffers
     alloc_buffers.MutateByApply([this](Buffer buf) {
       if (buffer_remap_.find(buf) != buffer_remap_.end()) {
@@ -171,15 +194,31 @@ private:
           auto bRegion_ = NormalizeToBufferRegion(call->args[1]);
           auto cRegion_ = NormalizeToBufferRegion(call->args[2]);
 
+          Array<Stmt> seq;
+          std::unordered_map<std::string, PrimExpr> new_args;
+
           auto buffer = aRegion_->buffer;
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.asram")
-                  << "Infer scope shared.asram of " << buffer
-                  << " in GEMM Sunmmio, but scope "
-                  << buffer_remap_[buffer].scope() << " has been inferred for "
-                  << buffer << ".";
+              if (buffer_remap_[buffer].scope() != "shared.asram") {
+                // insert a copy stmt
+                auto transfer_buffer = makeNewBufferWithScope(
+                    buffer, buffer_remap_[buffer].scope());
+                PrimExpr src_region =
+                    MakeRegionExpr(buffer, aRegion_->region, /*access_mask=*/1);
+                PrimExpr dst_region = MakeRegionExpr(
+                    transfer_buffer, aRegion_->region, /*access_mask=*/2);
+                Call copy_call = Call(DataType::Handle(), Copy::Get(),
+                                      {src_region, dst_region}, {});
+                seq.push_back(Evaluate(copy_call));
+                buffer_remap_.Set(
+                    transfer_buffer,
+                    makeBufferWithScope(transfer_buffer, "shared.asram"));
+
+                new_args.insert({"A", MakeRegionExpr(transfer_buffer,
+                                                     aRegion_->region, 1)});
+              }
             } else {
               auto remap_buffer =
                   makeBufferWithScope(aRegion_->buffer, "shared.asram");
@@ -195,11 +234,24 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.wsram")
-                  << "Infer scope shared.wsram of " << buffer
-                  << " in GEMM Sunmmio, but scope "
-                  << buffer_remap_[buffer].scope() << " has been inferred for "
-                  << buffer << ".";
+              if (buffer_remap_[buffer].scope() != "shared.wsram") {
+                // insert a copy stmt
+                auto transfer_buffer = makeNewBufferWithScope(
+                    buffer, buffer_remap_[buffer].scope());
+                PrimExpr src_region =
+                    MakeRegionExpr(buffer, bRegion_->region, /*access_mask=*/1);
+                PrimExpr dst_region = MakeRegionExpr(
+                    transfer_buffer, bRegion_->region, /*access_mask=*/2);
+                Call copy_call = Call(DataType::Handle(), Copy::Get(),
+                                      {src_region, dst_region}, {});
+                seq.push_back(Evaluate(copy_call));
+                buffer_remap_.Set(
+                    transfer_buffer,
+                    makeBufferWithScope(transfer_buffer, "shared.wsram"));
+
+                new_args.insert({"B", MakeRegionExpr(transfer_buffer,
+                                                     aRegion_->region, 1)});
+              }
             } else {
               auto remap_buffer =
                   makeBufferWithScope(bRegion_->buffer, "shared.wsram");
@@ -215,11 +267,24 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.rsram")
-                  << "Infer scope shared.rsram of " << buffer
-                  << " in GEMM Sunmmio, but scope "
-                  << buffer_remap_[buffer].scope() << " has been inferred for "
-                  << buffer << ".";
+              if (buffer_remap_[buffer].scope() !=
+                  "shared.rsram") { // insert a copy stmt
+                auto transfer_buffer = makeNewBufferWithScope(
+                    buffer, buffer_remap_[buffer].scope());
+                PrimExpr src_region =
+                    MakeRegionExpr(buffer, bRegion_->region, /*access_mask=*/1);
+                PrimExpr dst_region = MakeRegionExpr(
+                    transfer_buffer, bRegion_->region, /*access_mask=*/2);
+                Call copy_call = Call(DataType::Handle(), Copy::Get(),
+                                      {src_region, dst_region}, {});
+                seq.push_back(Evaluate(copy_call));
+                buffer_remap_.Set(
+                    transfer_buffer,
+                    makeBufferWithScope(transfer_buffer, "shared.wsram"));
+
+                new_args.insert({"C", MakeRegionExpr(transfer_buffer,
+                                                     aRegion_->region, 1)});
+              }
             } else {
               auto remap_buffer =
                   makeBufferWithScope(cRegion_->buffer, "shared.rsram");
@@ -230,11 +295,40 @@ private:
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
           }
+
+          if (!seq.empty() && !new_args.empty()) {
+            auto gemm_call = call;
+            ICHECK(gemm_call->args.size() == 19)
+                << "GEMM should have 19 parameters.";
+            Array<PrimExpr> new_gemm_args;
+            auto it = new_args.find("A");
+            if (it != new_args.end()) {
+              new_gemm_args.push_back(it->second);
+            } else {
+              new_gemm_args.push_back(gemm_call->args[0]);
+            }
+            it = new_args.find("B");
+            if (it != new_args.end()) {
+              new_gemm_args.push_back(it->second);
+            } else {
+              new_gemm_args.push_back(gemm_call->args[1]);
+            }
+            it = new_args.find("C");
+            if (it != new_args.end()) {
+              new_gemm_args.push_back(it->second);
+            } else {
+              new_gemm_args.push_back(gemm_call->args[2]);
+            }
+            for (auto i = 3; i < gemm_call->args.size(); i++) {
+              new_gemm_args.push_back(gemm_call->args[i]);
+            }
+            Call new_gemm(DataType::Handle(), call->op, new_gemm_args);
+            seq.push_back(Evaluate(new_gemm));
+            return SeqStmt::Flatten(seq);
+          }
         }
       }
-      return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
-
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
