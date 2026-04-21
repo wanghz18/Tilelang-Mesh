@@ -50,6 +50,17 @@ namespace tl {
 
 using namespace tir;
 
+/** Creates a compact 0-based region that preserves the original extents. */
+Array<Range> MakeCompactRegion(const Array<Range> &region) {
+  Array<Range> compact_region;
+  compact_region.reserve(region.size());
+  for (const Range &range : region) {
+    compact_region.push_back(Range::FromMinExtent(0, range->extent));
+  }
+  return compact_region;
+}
+
+/** Creates a temporary buffer that keeps the original buffer shape. */
 Buffer makeNewBufferWithScope(const Buffer &buffer, std::string scope) {
   const auto *ptr_type =
       TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
@@ -57,6 +68,25 @@ Buffer makeNewBufferWithScope(const Buffer &buffer, std::string scope) {
   Var new_var = Var(buffer->data->name_hint, new_type);
   return Buffer(new_var, buffer->dtype, buffer->shape, {}, buffer->elem_offset,
                 buffer->name, buffer->data_alignment, buffer->offset_factor,
+                buffer->buffer_type);
+}
+
+/** Creates a compact temporary buffer whose shape matches the region extents.
+ */
+Buffer makeNewCompactBufferWithScope(const Buffer &buffer,
+                                     const Array<Range> &region,
+                                     std::string scope) {
+  const auto *ptr_type =
+      TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+  Type new_type = PointerType(ptr_type->element_type, scope);
+  Var new_var = Var(buffer->data->name_hint, new_type);
+  Array<PrimExpr> shape;
+  shape.reserve(region.size());
+  for (const Range &range : region) {
+    shape.push_back(range->extent);
+  }
+  return Buffer(new_var, buffer->dtype, shape, {}, Integer(0), buffer->name,
+                buffer->data_alignment, buffer->offset_factor,
                 buffer->buffer_type);
 }
 
@@ -203,12 +233,13 @@ private:
             if (buffer_remap_.count(buffer)) {
               if (buffer_remap_[buffer].scope() != "shared.asram") {
                 // insert a copy stmt
-                auto transfer_buffer = makeNewBufferWithScope(
-                    buffer, buffer_remap_[buffer].scope());
+                auto transfer_region = MakeCompactRegion(aRegion_->region);
+                auto transfer_buffer = makeNewCompactBufferWithScope(
+                    buffer, transfer_region, buffer_remap_[buffer].scope());
                 PrimExpr src_region =
                     MakeRegionExpr(buffer, aRegion_->region, /*access_mask=*/1);
                 PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, aRegion_->region, /*access_mask=*/2);
+                    transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
                                       {src_region, dst_region}, {});
                 seq.push_back(Evaluate(copy_call));
@@ -216,8 +247,8 @@ private:
                     transfer_buffer,
                     makeBufferWithScope(transfer_buffer, "shared.asram"));
 
-                new_args.insert({"A", MakeRegionExpr(transfer_buffer,
-                                                     aRegion_->region, 1)});
+                new_args.insert(
+                    {"A", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
               }
             } else {
               auto remap_buffer =
@@ -236,12 +267,13 @@ private:
             if (buffer_remap_.count(buffer)) {
               if (buffer_remap_[buffer].scope() != "shared.wsram") {
                 // insert a copy stmt
-                auto transfer_buffer = makeNewBufferWithScope(
-                    buffer, buffer_remap_[buffer].scope());
+                auto transfer_region = MakeCompactRegion(bRegion_->region);
+                auto transfer_buffer = makeNewCompactBufferWithScope(
+                    buffer, transfer_region, buffer_remap_[buffer].scope());
                 PrimExpr src_region =
                     MakeRegionExpr(buffer, bRegion_->region, /*access_mask=*/1);
                 PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, bRegion_->region, /*access_mask=*/2);
+                    transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
                                       {src_region, dst_region}, {});
                 seq.push_back(Evaluate(copy_call));
@@ -249,8 +281,8 @@ private:
                     transfer_buffer,
                     makeBufferWithScope(transfer_buffer, "shared.wsram"));
 
-                new_args.insert({"B", MakeRegionExpr(transfer_buffer,
-                                                     aRegion_->region, 1)});
+                new_args.insert(
+                    {"B", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
               }
             } else {
               auto remap_buffer =
@@ -269,21 +301,22 @@ private:
             if (buffer_remap_.count(buffer)) {
               if (buffer_remap_[buffer].scope() !=
                   "shared.rsram") { // insert a copy stmt
-                auto transfer_buffer = makeNewBufferWithScope(
-                    buffer, buffer_remap_[buffer].scope());
+                auto transfer_region = MakeCompactRegion(cRegion_->region);
+                auto transfer_buffer = makeNewCompactBufferWithScope(
+                    buffer, transfer_region, buffer_remap_[buffer].scope());
                 PrimExpr src_region =
-                    MakeRegionExpr(buffer, bRegion_->region, /*access_mask=*/1);
+                    MakeRegionExpr(buffer, cRegion_->region, /*access_mask=*/1);
                 PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, bRegion_->region, /*access_mask=*/2);
+                    transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
                                       {src_region, dst_region}, {});
                 seq.push_back(Evaluate(copy_call));
                 buffer_remap_.Set(
                     transfer_buffer,
-                    makeBufferWithScope(transfer_buffer, "shared.wsram"));
+                    makeBufferWithScope(transfer_buffer, "shared.rsram"));
 
-                new_args.insert({"C", MakeRegionExpr(transfer_buffer,
-                                                     aRegion_->region, 1)});
+                new_args.insert(
+                    {"C", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
               }
             } else {
               auto remap_buffer =

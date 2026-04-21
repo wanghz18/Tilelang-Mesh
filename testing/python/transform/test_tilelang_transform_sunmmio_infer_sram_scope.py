@@ -936,3 +936,82 @@ def test_tilelang_insert_copy_infer_sram_scope(kernel):
                 if isinstance(arg, Call) and arg.op == tvm.tir.op.Op.get("tl.tileop.region"):
                     buffer = arg.args[0].buffer
                     assert buffer.scope() == scope_dict[i]
+
+
+def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
+    @T.prim_func
+    def gemm(
+        A: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=accum_dtype,
+        ),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((32, 32), dtype, scope="shared.asram")
+            B_shared = T.alloc_shared((32, 32), dtype)
+            C_shared = T.alloc_shared((32, 32), accum_dtype, scope="shared.rsram")
+
+            T.copy(A[0:32, 0:32], A_shared)
+            T.copy(B[0:32, 0:32], B_shared)
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(B_shared[0:16, 4:20], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+
+    return gemm
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [sliced_conflict_matmul()],
+)
+def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+
+        after_gemms = extract_gemm_from_kernel(list(mod.functions.values())[0])
+        assert len(after_gemms) == 2
+
+        compact_region = after_gemms[1].args[0]
+        assert isinstance(compact_region, Call)
+        assert compact_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+
+        compact_buffer = compact_region.args[0].buffer
+        assert compact_buffer.scope() == "shared.asram"
+        assert len(compact_buffer.shape) == 2
+        assert int(compact_buffer.shape[0]) == 16
+        assert int(compact_buffer.shape[1]) == 16
+        assert int(compact_region.args[0].indices[0]) == 0
+        assert int(compact_region.args[0].indices[1]) == 0
+        assert int(compact_region.args[2]) == 16
+        assert int(compact_region.args[3]) == 16
