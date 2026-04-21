@@ -551,9 +551,27 @@ def gemm_matmul_C_scope_infer_conflict(M, N, K, block_M, block_N, block_K, dtype
     return tvm.IRModule({"main": main})
 
 
+def incorrect_bufferload(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.asram")
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.wsram")
+
+            for i, j in T.Tiles(A_shared, parallel=True):
+                A_shared[i, j] = B_shared[i, j]
+
+    return tvm.IRModule({"main": main})
+
+
 INCORRECT_TEST_CASES = [
     (gemm_matmul_incorrect_A_scope(128, 128, 128, 32, 32, 32), "Specify invalid scope shared.wsram of A_shared in GEMM Sunmmio."),
     (gemm_matmul_incorrect_B_scope(128, 128, 128, 32, 32, 32), "Specify invalid scope shared.asram of B_shared in GEMM Sunmmio."),
+    (incorrect_bufferload(128, 128, 128, 32, 32, 32), "Invalid scope shared.wsram of B_shared in Sunmmio."),
     (
         flashattn(
             1,

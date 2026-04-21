@@ -806,8 +806,41 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
-  return Evaluate(
-      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
+  if (src.scope() != "global" || dst.scope() != "shared.asram") {
+    return Evaluate(
+        Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
+  }
+
+  ICHECK_EQ(src_range.size(), dst_range.size())
+      << "Sunmmio DMA staging requires src and dst to have the same rank.";
+
+  Array<PrimExpr> temp_shape;
+  Array<Range> temp_range;
+  temp_shape.reserve(dst_range.size());
+  temp_range.reserve(dst_range.size());
+
+  for (size_t i = 0; i < dst_range.size(); ++i) {
+    ICHECK(analyzer->CanProveEqual(src_range[i]->extent, dst_range[i]->extent))
+        << "Sunmmio DMA staging requires matching src/dst extents at dim " << i
+        << ", but got " << src_range[i]->extent << " vs. "
+        << dst_range[i]->extent << ".";
+    temp_shape.push_back(dst_range[i]->extent);
+    temp_range.push_back(Range::FromMinExtent(0, dst_range[i]->extent));
+  }
+
+  Buffer temp = decl_buffer(temp_shape, dst->dtype, dst->name + "_rsram_stage",
+                            "shared.rsram");
+  PrimExpr temp_write_region =
+      MakeRegionExpr(temp, temp_range, /*access_mask=*/2);
+  PrimExpr temp_read_region =
+      MakeRegionExpr(temp, temp_range, /*access_mask=*/1);
+
+  /** @brief Stage global-to-asram DMA through shared.rsram. */
+  Array<Stmt> seq{Evaluate(Call(DataType::Handle(), dma_copy(),
+                                {src_region, temp_write_region})),
+                  Evaluate(Call(DataType::Handle(), dma_copy(),
+                                {temp_read_region, dst_region}))};
+  return DeclBuffer(temp, SeqStmt::Flatten(seq));
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,

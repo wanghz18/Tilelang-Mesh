@@ -326,6 +326,7 @@ private:
             seq.push_back(Evaluate(new_gemm));
             return SeqStmt::Flatten(seq);
           }
+          return tvm::ffi::GetRef<Stmt>(op);
         }
       }
     }
@@ -335,6 +336,20 @@ private:
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
     if (!replace_flag) {
+      auto buffer = load->buffer;
+      if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+        if (buffer_remap_.count(buffer)) {
+          ICHECK(buffer_remap_[buffer].scope() == "shared.rsram")
+              << "Buffer " << buffer
+              << " used in BufferLoad should be shared.rsram.";
+        } else {
+          buffers_to_infer.insert(buffer);
+        }
+      } else if ((buffer.scope() != "shared.rsram") &&
+                 (buffer.scope() != "global")) {
+        ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
+                  << " in Sunmmio.";
+      }
       return load;
     }
     auto buffer = load->buffer;
@@ -373,18 +388,11 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (!replace_flag)
-      return StmtExprMutator::VisitExpr_(op);
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
-      ICHECK_EQ(op->args.size(), 5U);
-      Var buffer_data = Downcast<Var>(op->args[1]);
-      if (!var_remap_.count(buffer_data)) {
-        return StmtExprMutator::VisitExpr_(op);
+    if (!replace_flag) {
+      auto tile_op = ParseOperator(tvm::ffi::GetRef<Call>(op));
+      if (auto *copy = tile_op.as<CopyNode>()) {
+        return tvm::ffi::GetRef<Call>(op);
       }
-      Var new_data = var_remap_[buffer_data];
-      return Call(
-          op->dtype, op->op,
-          {op->args[0], new_data, op->args[2], op->args[3], op->args[4]});
     }
     auto expr = StmtExprMutator::VisitExpr_(op);
     return expr;
