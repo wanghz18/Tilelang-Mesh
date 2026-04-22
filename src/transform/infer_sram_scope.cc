@@ -90,6 +90,12 @@ Buffer makeNewCompactBufferWithScope(const Buffer &buffer,
                 buffer->buffer_type);
 }
 
+struct BufferSourceInfo {
+  Buffer src_buffer;
+  Array<Range> src_region;
+  Array<Range> dst_region;
+};
+
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -123,6 +129,14 @@ public:
 
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
+
+  static bool CanDirectConflictCopy(const std::string &src_scope,
+                                    const std::string &dst_scope) {
+    return src_scope == "shared.rsram" &&
+           (dst_scope == "shared.asram" || dst_scope == "shared.wsram" ||
+            dst_scope == "shared.rsram");
+  }
+
   Stmt VisitStmt_(const BlockRealizeNode *op) final {
     BlockRealize block_realize =
         Downcast<BlockRealize>(StmtExprMutator::VisitStmt_(op));
@@ -231,13 +245,27 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              if (buffer_remap_[buffer].scope() != "shared.asram") {
+              std::string current_scope = buffer_remap_[buffer].scope();
+              if (current_scope != "shared.asram") {
                 // insert a copy stmt
                 auto transfer_region = MakeCompactRegion(aRegion_->region);
                 auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, buffer_remap_[buffer].scope());
-                PrimExpr src_region =
-                    MakeRegionExpr(buffer, aRegion_->region, /*access_mask=*/1);
+                    buffer, transfer_region, current_scope);
+                PrimExpr src_region;
+                if (CanDirectConflictCopy(current_scope, "shared.asram")) {
+                  src_region = MakeRegionExpr(buffer, aRegion_->region,
+                                              /*access_mask=*/1);
+                } else {
+                  auto maybe_source_region =
+                      TryTranslateSourceRegion(buffer, aRegion_->region);
+                  ICHECK(maybe_source_region.defined())
+                      << "Cannot resolve source for conflicting A operand "
+                      << buffer << ".";
+                  src_region =
+                      MakeRegionExpr(maybe_source_region.value()->buffer,
+                                     maybe_source_region.value()->region,
+                                     /*access_mask=*/1);
+                }
                 PrimExpr dst_region = MakeRegionExpr(
                     transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
@@ -265,13 +293,27 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              if (buffer_remap_[buffer].scope() != "shared.wsram") {
+              std::string current_scope = buffer_remap_[buffer].scope();
+              if (current_scope != "shared.wsram") {
                 // insert a copy stmt
                 auto transfer_region = MakeCompactRegion(bRegion_->region);
                 auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, buffer_remap_[buffer].scope());
-                PrimExpr src_region =
-                    MakeRegionExpr(buffer, bRegion_->region, /*access_mask=*/1);
+                    buffer, transfer_region, current_scope);
+                PrimExpr src_region;
+                if (CanDirectConflictCopy(current_scope, "shared.wsram")) {
+                  src_region = MakeRegionExpr(buffer, bRegion_->region,
+                                              /*access_mask=*/1);
+                } else {
+                  auto maybe_source_region =
+                      TryTranslateSourceRegion(buffer, bRegion_->region);
+                  ICHECK(maybe_source_region.defined())
+                      << "Cannot resolve source for conflicting B operand "
+                      << buffer << ".";
+                  src_region =
+                      MakeRegionExpr(maybe_source_region.value()->buffer,
+                                     maybe_source_region.value()->region,
+                                     /*access_mask=*/1);
+                }
                 PrimExpr dst_region = MakeRegionExpr(
                     transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
@@ -299,13 +341,26 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              if (buffer_remap_[buffer].scope() !=
-                  "shared.rsram") { // insert a copy stmt
+              std::string current_scope = buffer_remap_[buffer].scope();
+              if (current_scope != "shared.rsram") { // insert a copy stmt
                 auto transfer_region = MakeCompactRegion(cRegion_->region);
                 auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, buffer_remap_[buffer].scope());
-                PrimExpr src_region =
-                    MakeRegionExpr(buffer, cRegion_->region, /*access_mask=*/1);
+                    buffer, transfer_region, current_scope);
+                PrimExpr src_region;
+                if (CanDirectConflictCopy(current_scope, "shared.rsram")) {
+                  src_region = MakeRegionExpr(buffer, cRegion_->region,
+                                              /*access_mask=*/1);
+                } else {
+                  auto maybe_source_region =
+                      TryTranslateSourceRegion(buffer, cRegion_->region);
+                  ICHECK(maybe_source_region.defined())
+                      << "Cannot resolve source for conflicting C operand "
+                      << buffer << ".";
+                  src_region =
+                      MakeRegionExpr(maybe_source_region.value()->buffer,
+                                     maybe_source_region.value()->region,
+                                     /*access_mask=*/1);
+                }
                 PrimExpr dst_region = MakeRegionExpr(
                     transfer_buffer, transfer_region, /*access_mask=*/2);
                 Call copy_call = Call(DataType::Handle(), Copy::Get(),
@@ -424,6 +479,11 @@ private:
     if (!replace_flag) {
       auto tile_op = ParseOperator(tvm::ffi::GetRef<Call>(op));
       if (auto *copy = tile_op.as<CopyNode>()) {
+        if (copy->dst.defined() && copy->src.defined() &&
+            copy->dst.scope() != "global") {
+          buffer_source_map_[copy->dst] =
+              BufferSourceInfo{copy->src, copy->src_range, copy->dst_range};
+        }
         return tvm::ffi::GetRef<Call>(op);
       }
     }
@@ -470,10 +530,43 @@ private:
 
   Map<Buffer, Buffer> buffer_remap_;
   Map<Var, Var> var_remap_;
+  std::unordered_map<Buffer, BufferSourceInfo, ObjectPtrHash, ObjectPtrEqual>
+      buffer_source_map_;
 
   std::set<Buffer> buffers_to_infer;
 
   bool replace_flag = false;
+
+  Optional<BufferRegion>
+  TryTranslateSourceRegion(const Buffer &buffer,
+                           const Array<Range> &requested_region) {
+    auto it = buffer_source_map_.find(buffer);
+    if (it == buffer_source_map_.end()) {
+      return Optional<BufferRegion>();
+    }
+    const BufferSourceInfo &info = it->second;
+    if (info.dst_region.size() != requested_region.size() ||
+        info.src_region.size() != requested_region.size()) {
+      return Optional<BufferRegion>();
+    }
+
+    Array<Range> translated_region;
+    translated_region.reserve(requested_region.size());
+    for (size_t i = 0; i < requested_region.size(); ++i) {
+      PrimExpr delta = analyzer_->Simplify(requested_region[i]->min -
+                                           info.dst_region[i]->min);
+      PrimExpr upper = analyzer_->Simplify(delta + requested_region[i]->extent);
+      if (!analyzer_->CanProve(delta >= 0) ||
+          !analyzer_->CanProve(upper <= info.dst_region[i]->extent)) {
+        return Optional<BufferRegion>();
+      }
+      PrimExpr source_min =
+          analyzer_->Simplify(info.src_region[i]->min + delta);
+      translated_region.push_back(
+          Range::FromMinExtent(source_min, requested_region[i]->extent));
+    }
+    return BufferRegion(info.src_buffer, translated_region);
+  }
 };
 
 tvm::transform::Pass InferSramScope() {

@@ -27,6 +27,18 @@ def extract_gemm_from_kernel(func):
     return stmts
 
 
+def extract_copy_from_kernel(func):
+    stmts = []
+
+    def visit_buffer_access(node):
+        if isinstance(node, Call) and node.op == tvm.tir.op.Op.get("tl.tileop.copy"):
+            stmts.append(node)
+
+    post_order_visit(func.body, visit_buffer_access)
+
+    return stmts
+
+
 def extract_buffers_from_kernel(func) -> Set[Buffer]:
     """Extract all buffers used in a TIR PrimFunc."""
     used_buffers = set()
@@ -34,6 +46,9 @@ def extract_buffers_from_kernel(func) -> Set[Buffer]:
     def visit_buffer_access(node):
         if isinstance(node, (BufferLoad, BufferStore)):
             used_buffers.add(node.buffer)
+        elif isinstance(node, Block):
+            for buffer in node.alloc_buffers:
+                used_buffers.add(buffer)
 
     # Visit function body to find buffer accesses
     post_order_visit(func.body, visit_buffer_access)
@@ -970,14 +985,19 @@ def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
         ),
     ):
         with T.Kernel(1, 1, threads=128) as (bx, by):
-            A_shared = T.alloc_shared((32, 32), dtype, scope="shared.asram")
+            A_shared = T.alloc_shared((32, 32), dtype)
             B_shared = T.alloc_shared((32, 32), dtype)
-            C_shared = T.alloc_shared((32, 32), accum_dtype, scope="shared.rsram")
+            C_shared = T.alloc_shared((32, 32), accum_dtype)
 
             T.copy(A[0:32, 0:32], A_shared)
             T.copy(B[0:32, 0:32], B_shared)
             T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
             T.gemm(B_shared[0:16, 4:20], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], B_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], A_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], A_shared[0:16, 0:16])
+            T.gemm(C_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], C_shared[0:16, 4:20], C_shared[0:16, 0:16])
 
     return gemm
 
@@ -999,19 +1019,70 @@ def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
         mod = tilelang.transform.Simplify()(mod)
         mod = tl.transform.InferSramScope()(mod)
 
-        after_gemms = extract_gemm_from_kernel(list(mod.functions.values())[0])
-        assert len(after_gemms) == 2
+        func = list(mod.functions.values())[0]
+        after_gemms = extract_gemm_from_kernel(func)
+        after_copies = extract_copy_from_kernel(func)
+        assert len(after_gemms) == 7
+        assert len(after_copies) == 8
 
-        compact_region = after_gemms[1].args[0]
-        assert isinstance(compact_region, Call)
-        assert compact_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+        script = mod.script()
+        expected_copies = [
+            "T.copy(T.region(B[0, 4], 1, 16, 16), T.region(B_shared_1[0, 0], 2, 16, 16))",
+            "T.copy(T.region(B[0, 0], 1, 16, 16), T.region(B_shared_2[0, 0], 2, 16, 16))",
+            "T.copy(T.region(A[0, 4], 1, 16, 16), T.region(A_shared_1[0, 0], 2, 16, 16))",
+            "T.copy(T.region(A[0, 0], 1, 16, 16), T.region(A_shared_2[0, 0], 2, 16, 16))",
+            "T.copy(T.region(C_shared[0, 0], 1, 16, 16), T.region(C_shared_1[0, 0], 2, 16, 16))",
+            "T.copy(T.region(C_shared[0, 4], 1, 16, 16), T.region(C_shared_2[0, 0], 2, 16, 16))",
+        ]
+        for expected_copy in expected_copies:
+            assert expected_copy in script
 
-        compact_buffer = compact_region.args[0].buffer
-        assert compact_buffer.scope() == "shared.asram"
-        assert len(compact_buffer.shape) == 2
-        assert int(compact_buffer.shape[0]) == 16
-        assert int(compact_buffer.shape[1]) == 16
-        assert int(compact_region.args[0].indices[0]) == 0
-        assert int(compact_region.args[0].indices[1]) == 0
-        assert int(compact_region.args[2]) == 16
-        assert int(compact_region.args[3]) == 16
+        staged_copy_regions = [copy.args[1] for copy in after_copies[2:]]
+        staged_copy_scopes = [region.args[0].buffer.scope() for region in staged_copy_regions]
+        assert staged_copy_scopes == [
+            "shared.asram",
+            "shared.rsram",
+            "shared.wsram",
+            "shared.rsram",
+            "shared.asram",
+            "shared.wsram",
+        ]
+
+        for staged_copy_region in staged_copy_regions:
+            assert isinstance(staged_copy_region, Call)
+            assert staged_copy_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+            staged_buffer = staged_copy_region.args[0].buffer
+            assert len(staged_buffer.shape) == 2
+            assert int(staged_buffer.shape[0]) == 16
+            assert int(staged_buffer.shape[1]) == 16
+
+        compact_regions = [
+            after_gemms[1].args[0],
+            after_gemms[2].args[2],
+            after_gemms[3].args[1],
+            after_gemms[4].args[2],
+            after_gemms[5].args[0],
+            after_gemms[6].args[1],
+        ]
+        expected_scopes = [
+            "shared.asram",
+            "shared.rsram",
+            "shared.wsram",
+            "shared.rsram",
+            "shared.asram",
+            "shared.wsram",
+        ]
+
+        for compact_region, expected_scope in zip(compact_regions, expected_scopes):
+            assert isinstance(compact_region, Call)
+            assert compact_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+
+            compact_buffer = compact_region.args[0].buffer
+            assert compact_buffer.scope() == expected_scope
+            assert len(compact_buffer.shape) == 2
+            assert int(compact_buffer.shape[0]) == 16
+            assert int(compact_buffer.shape[1]) == 16
+            assert int(compact_region.args[0].indices[0]) == 0
+            assert int(compact_region.args[0].indices[1]) == 0
+            assert int(compact_region.args[2]) == 16
+            assert int(compact_region.args[3]) == 16
