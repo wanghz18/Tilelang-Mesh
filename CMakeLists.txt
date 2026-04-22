@@ -153,6 +153,12 @@ if(USE_NPUIR)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/CMakeLists.txt")
     message(STATUS "NPU-IR integration enabled.")
 
+    set(
+      TILELANG_NPUIR_BINARY_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR"
+      CACHE PATH "Binary directory for the embedded NPU-IR build"
+    )
+
     # In-place fix for NPU-IR's LLVM/MLIR build issues
     # 1. Provide LLVM/MLIR tablegen binaries
     set(LLVM_TABLEGEN_EXE llvm-tblgen CACHE FILEPATH "Path to llvm-tblgen")
@@ -163,10 +169,21 @@ if(USE_NPUIR)
       set(LLVM_PROJECT_DIR "${NPUIR_USE_LLVM_SOURCE_DIR}")
       message(STATUS "NPU-IR using external LLVM source: ${LLVM_PROJECT_DIR}")
     else()
-      set(LLVM_PROJECT_DIR "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/llvm-project")
+      set(LLVM_PROJECT_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project")
+      if(EXISTS "${LLVM_PROJECT_DIR}/llvm/CMakeLists.txt")
+        set(
+          NPUIR_USE_LLVM_SOURCE_DIR
+          "${LLVM_PROJECT_DIR}"
+          CACHE PATH "Path to a cached llvm-project checkout for the embedded NPU-IR build"
+          FORCE
+        )
+        message(STATUS "Using cached NPU-IR LLVM sources from ${NPUIR_USE_LLVM_SOURCE_DIR}")
+      else()
+        message(STATUS "No cached NPU-IR LLVM sources found at ${LLVM_PROJECT_DIR}; NPU-IR will manage the checkout")
+      endif()
     endif()
 
-    set(LLVM_PROJECT_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/llvm-project-build")
+    set(LLVM_PROJECT_BUILD_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project-build")
 
     # 3. Preemptively set include directories and module paths
     set(MLIR_INCLUDE_DIRS
@@ -211,10 +228,10 @@ if(USE_NPUIR)
       CACHE PATH "" FORCE
     )
 
-    add_subdirectory(3rdparty/NPU-IR EXCLUDE_FROM_ALL)
+    add_subdirectory(3rdparty/NPU-IR "${TILELANG_NPUIR_BINARY_DIR}" EXCLUDE_FROM_ALL)
     list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
     # Generated headers (e.g., from TableGen) will be in the binary directory
-    list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/include)
+    list(APPEND TILE_LANG_INCLUDES ${TILELANG_NPUIR_BINARY_DIR}/include)
     list(APPEND TILE_LANG_INCLUDES ${MLIR_INCLUDE_DIRS})
     list(APPEND TILE_LANG_INCLUDES ${LLVM_INCLUDE_DIRS})
   else()
