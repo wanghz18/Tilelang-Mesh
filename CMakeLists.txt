@@ -488,7 +488,7 @@ add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm)
 
 if(TARGET MLIRIR)
-  target_link_libraries(tilelang PRIVATE MLIRIR MLIRFuncDialect MLIRSupport)
+  target_link_libraries(tilelang PRIVATE MLIRIR MLIRFuncDialect MLIRArithDialect MLIRSupport)
 endif()
 if(TARGET LLVMSupport)
   target_link_libraries(tilelang PRIVATE LLVMSupport)
