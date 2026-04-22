@@ -165,11 +165,7 @@ def test_inject_sunmmio_sync_mma():
         for idx, line in enumerate(lines)
         if "mma_sunmmio" in line and "sync_token_id(" in line
     ]
-    wait_entries = [
-        (idx, line, extract_token_id(line, "wait_token"))
-        for idx, line in enumerate(lines)
-        if "wait_token(" in line
-    ]
+    wait_entries = [(idx, line, extract_token_id(line, "wait_token")) for idx, line in enumerate(lines) if "wait_token(" in line]
 
     assert len(dma_entries) >= 3
     assert len(mma_entries) == 1
@@ -189,17 +185,13 @@ def test_inject_sunmmio_sync_mma():
     # result, such as the final store.
     assert post_mma_dma_entries
     first_post_mma_dma_idx = min(idx for idx, _ in post_mma_dma_entries)
-    mma_wait_indices = [
-        idx for idx, _, token in wait_entries if token == mma_token and idx > mma_idx
-    ]
+    mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > mma_idx]
     assert mma_wait_indices
     assert min(mma_wait_indices) < first_post_mma_dma_idx
 
     # Every DMA after MMA should eventually be waited on as well.
     for dma_idx, dma_token in post_mma_dma_entries:
-        wait_indices = [
-            idx for idx, _, token in wait_entries if token == dma_token and idx > dma_idx
-        ]
+        wait_indices = [idx for idx, _, token in wait_entries if token == dma_token and idx > dma_idx]
         assert wait_indices, f"Missing wait_token({dma_token}) after DMA line {dma_idx}"
 
 
@@ -337,11 +329,7 @@ def test_inject_sunmmio_sync_if():
         for idx, line in enumerate(lines)
         if "broadcast_" in line and "sync_token_id(" in line
     ]
-    wait_entries = [
-        (idx, line, extract_token_id(line, "wait_token"))
-        for idx, line in enumerate(lines)
-        if "wait_token(" in line
-    ]
+    wait_entries = [(idx, line, extract_token_id(line, "wait_token")) for idx, line in enumerate(lines) if "wait_token(" in line]
 
     assert len(dma_entries) >= 2
     assert len(mma_entries) == 1
@@ -351,12 +339,8 @@ def test_inject_sunmmio_sync_if():
     broadcast_idx, _, broadcast_token = broadcast_entries[0]
     if_idx = next(idx for idx, line in enumerate(lines) if line == "if by == 0:")
     barrier_init_idx = next(idx for idx, line in enumerate(lines) if "barrier_init" in line)
-    barrier_wait_idx = next(
-        idx for idx, line in enumerate(lines) if "barrier_arrive_and_wait" in line
-    )
-    final_store_idx = next(
-        idx for idx, line in enumerate(lines) if "C_shared[0, 0] = C_shared[0, 0] +" in line
-    )
+    barrier_wait_idx = next(idx for idx, line in enumerate(lines) if "barrier_arrive_and_wait" in line)
+    final_store_idx = next(idx for idx, line in enumerate(lines) if "C_shared[0, 0] = C_shared[0, 0] +" in line)
 
     pre_mma_dma_tokens = [token for idx, _, token in dma_entries if idx < mma_idx]
     pre_mma_wait_tokens = {token for idx, _, token in wait_entries if idx < mma_idx}
@@ -365,11 +349,7 @@ def test_inject_sunmmio_sync_if():
     assert set(pre_mma_dma_tokens).issubset(pre_mma_wait_tokens)
 
     # The conditional branch should wait for the MMA result before broadcasting it.
-    branch_wait_indices = [
-        idx
-        for idx, _, token in wait_entries
-        if token == mma_token and if_idx < idx < broadcast_idx
-    ]
+    branch_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and if_idx < idx < broadcast_idx]
     assert branch_wait_indices
     assert mma_idx < min(branch_wait_indices) < broadcast_idx
 
@@ -377,20 +357,12 @@ def test_inject_sunmmio_sync_if():
     assert if_idx < broadcast_idx < barrier_init_idx
 
     # The broadcast token must be waited on before the outer barrier wait.
-    broadcast_wait_indices = [
-        idx
-        for idx, _, token in wait_entries
-        if token == broadcast_token and idx > barrier_init_idx
-    ]
+    broadcast_wait_indices = [idx for idx, _, token in wait_entries if token == broadcast_token and idx > barrier_init_idx]
     assert broadcast_wait_indices
     assert barrier_init_idx < min(broadcast_wait_indices) < barrier_wait_idx
 
     # The MMA token should also be waited on after the branch before C_shared is consumed.
-    post_branch_mma_wait_indices = [
-        idx
-        for idx, _, token in wait_entries
-        if token == mma_token and idx > barrier_wait_idx
-    ]
+    post_branch_mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > barrier_wait_idx]
     assert post_branch_mma_wait_indices
     assert barrier_wait_idx < min(post_branch_mma_wait_indices) < final_store_idx
 
