@@ -144,6 +144,22 @@ def test_inject_sunmmio_sync_mma():
     assert "wait_token" in script
     assert "sync_token_id" in script
 
+    # Check that mma depends on previous copies
+    # Copies (Token 0, 1) -> Wait(0), Wait(1) -> MMA (Token 2) -> Wait(2) -> Copy (Token 3)
+    # The exact token IDs depend on the order of operations
+
+    # Expected sequence roughly:
+    # dma_copy(token=0) (load A')
+    # wait_token(0)
+    # dma_copy(token=1) (load A)
+    # dma_copy(token=2) (load B)
+    # wait_token(1)
+    # wait_token(2)
+    # mma_sunmmio(token=3)
+    # wait_token(3)
+    # dma_copy(token=4) (store C)
+    # wait_token(4)
+    
     lines = [l.strip() for l in script.split("\n")]
 
     def extract_token_id(line, marker):
