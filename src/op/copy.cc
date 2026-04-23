@@ -804,15 +804,22 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
+  ICHECK_EQ(src_range.size(), dst_range.size())
+      << "Sunmmio DMA staging requires src and dst to have the same rank.";
+  for (size_t i = 0; i < dst_range.size(); ++i) {
+    ICHECK(analyzer->CanProveEqual(src_range[i]->extent, dst_range[i]->extent))
+        << "Sunmmio DMA staging requires matching src/dst extents at dim " << i
+        << ", but got " << src_range[i]->extent << " vs. "
+        << dst_range[i]->extent << ".";
+  }
+
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+
   if (src.scope() != "global" || dst.scope() != "shared.asram") {
     return Evaluate(
         Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
   }
-
-  ICHECK_EQ(src_range.size(), dst_range.size())
-      << "Sunmmio DMA staging requires src and dst to have the same rank.";
 
   Array<PrimExpr> temp_shape;
   Array<Range> temp_range;
@@ -820,16 +827,17 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
   temp_range.reserve(dst_range.size());
 
   for (size_t i = 0; i < dst_range.size(); ++i) {
-    ICHECK(analyzer->CanProveEqual(src_range[i]->extent, dst_range[i]->extent))
-        << "Sunmmio DMA staging requires matching src/dst extents at dim " << i
-        << ", but got " << src_range[i]->extent << " vs. "
-        << dst_range[i]->extent << ".";
     temp_shape.push_back(dst_range[i]->extent);
     temp_range.push_back(Range::FromMinExtent(0, dst_range[i]->extent));
   }
 
   Buffer temp = decl_buffer(temp_shape, dst->dtype, dst->name + "_rsram_stage",
                             "shared.rsram");
+  if (temp->shape.size() > 1) {
+    const auto f =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    T.AddLayout(temp, Downcast<Layout>((*f)(temp)));
+  }
   PrimExpr temp_write_region =
       MakeRegionExpr(temp, temp_range, /*access_mask=*/2);
   PrimExpr temp_read_region =

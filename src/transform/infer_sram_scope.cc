@@ -130,11 +130,73 @@ public:
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  static bool CanDirectConflictCopy(const std::string &src_scope,
-                                    const std::string &dst_scope) {
+  class LocalBufferUseCollector : public StmtExprVisitor {
+  public:
+    /** @brief Collect buffers referenced directly in the current block body. */
+    static std::unordered_set<const VarNode *> Collect(const Stmt &stmt) {
+      LocalBufferUseCollector collector;
+      collector.VisitStmt(stmt);
+      return collector.used_buffer_vars_;
+    }
+
+  private:
+    void VisitStmt_(const BlockRealizeNode *op) final {
+      /** @brief Nested blocks own their own alloc_buffers, so skip them here.
+       */
+      return;
+    }
+
+    void VisitStmt_(const BufferStoreNode *op) final {
+      used_buffer_vars_.insert(op->buffer->data.get());
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitExpr_(const BufferLoadNode *op) final {
+      used_buffer_vars_.insert(op->buffer->data.get());
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitExpr_(const VarNode *op) final { used_buffer_vars_.insert(op); }
+
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(RegionOp::Get())) {
+        BufferRegion region =
+            NormalizeToBufferRegion(tvm::ffi::GetRef<Call>(op));
+        used_buffer_vars_.insert(region->buffer->data.get());
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    std::unordered_set<const VarNode *> used_buffer_vars_;
+  };
+
+  static bool CanCopyDirectly(const std::string &src_scope,
+                              const std::string &dst_scope) {
     return src_scope == "shared.rsram" &&
            (dst_scope == "shared.asram" || dst_scope == "shared.wsram" ||
             dst_scope == "shared.rsram");
+  }
+
+  Buffer RemapBuffer(const Buffer &buffer) {
+    if (buffer_remap_.count(buffer)) {
+      return buffer_remap_[buffer];
+    }
+    if (var_remap_.count(buffer->data)) {
+      return Buffer(var_remap_[buffer->data], buffer->dtype, buffer->shape,
+                    buffer->strides, buffer->elem_offset, buffer->name,
+                    buffer->data_alignment, buffer->offset_factor,
+                    buffer->buffer_type);
+    }
+    return buffer;
+  }
+
+  BufferRegion RemapBufferRegion(const BufferRegion &region) {
+    return BufferRegion(RemapBuffer(region->buffer), region->region);
+  }
+
+  MatchBufferRegion RemapMatchBufferRegion(const MatchBufferRegion &match) {
+    return MatchBufferRegion(RemapBuffer(match->buffer),
+                             RemapBufferRegion(match->source));
   }
 
   Stmt VisitStmt_(const BlockRealizeNode *op) final {
@@ -147,6 +209,7 @@ private:
       for (auto buffer : alloc_buffers) {
         if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
           buffers_to_infer.insert(buffer);
+          original_alloc_buffers_.insert(buffer);
         } else if ((buffer.scope() != "shared.asram") &&
                    (buffer.scope() != "shared.wsram") &&
                    (buffer.scope() != "shared.rsram")) {
@@ -193,27 +256,68 @@ private:
       block.CopyOnWrite()->annotations.Set(attr::kTileViewMap, new_map);
     }
 
-    // do block->alloc_buffers remap
-    Array<Buffer> alloc_buffers = block->alloc_buffers;
+    Array<BufferRegion> reads;
+    reads.reserve(block->reads.size());
+    for (const BufferRegion &region : block->reads) {
+      reads.push_back(RemapBufferRegion(region));
+    }
 
-    for (auto it : buffer_remap_) {
-      bool exists = std::find(alloc_buffers.begin(), alloc_buffers.end(),
-                              it.first) != alloc_buffers.end();
-      if (!exists) {
-        alloc_buffers.push_back(it.first);
+    Array<BufferRegion> writes;
+    writes.reserve(block->writes.size());
+    for (const BufferRegion &region : block->writes) {
+      writes.push_back(RemapBufferRegion(region));
+    }
+
+    Array<MatchBufferRegion> match_buffers;
+    match_buffers.reserve(block->match_buffers.size());
+    for (const MatchBufferRegion &match : block->match_buffers) {
+      match_buffers.push_back(RemapMatchBufferRegion(match));
+    }
+
+    /** @brief Remap block-local allocations and add only block-local
+     * temporaries. */
+    Array<Buffer> alloc_buffers;
+    for (const Buffer &buf : block->alloc_buffers) {
+      if (buffer_remap_.find(buf) != buffer_remap_.end()) {
+        alloc_buffers.push_back(buffer_remap_.at(buf));
+      } else {
+        alloc_buffers.push_back(buf);
       }
     }
 
-    // remove the buffers
-    alloc_buffers.MutateByApply([this](Buffer buf) {
-      if (buffer_remap_.find(buf) != buffer_remap_.end()) {
-        return buffer_remap_.at(buf);
+    std::unordered_map<const VarNode *, Buffer> remapped_buffers_by_var;
+    for (const auto &it : buffer_remap_) {
+      if (original_alloc_buffers_.count(it.first)) {
+        continue;
       }
-      return buf;
-    });
+      remapped_buffers_by_var[it.second->data.get()] = it.second;
+    }
+
+    std::unordered_set<const VarNode *> used_buffer_vars =
+        LocalBufferUseCollector::Collect(block->body);
+    for (const VarNode *buf_var : used_buffer_vars) {
+      auto it = remapped_buffers_by_var.find(buf_var);
+      if (it == remapped_buffers_by_var.end()) {
+        continue;
+      }
+      bool exists = std::find(alloc_buffers.begin(), alloc_buffers.end(),
+                              it->second) != alloc_buffers.end();
+      if (!exists) {
+        alloc_buffers.push_back(it->second);
+      }
+    }
 
     if (!alloc_buffers.same_as(block->alloc_buffers)) {
       block.CopyOnWrite()->alloc_buffers = alloc_buffers;
+    }
+    if (!reads.same_as(block->reads)) {
+      block.CopyOnWrite()->reads = reads;
+    }
+    if (!writes.same_as(block->writes)) {
+      block.CopyOnWrite()->writes = writes;
+    }
+    if (!match_buffers.same_as(block->match_buffers)) {
+      block.CopyOnWrite()->match_buffers = match_buffers;
     }
     block_realize.CopyOnWrite()->block = block;
 
@@ -252,7 +356,7 @@ private:
                 auto transfer_buffer = makeNewCompactBufferWithScope(
                     buffer, transfer_region, current_scope);
                 PrimExpr src_region;
-                if (CanDirectConflictCopy(current_scope, "shared.asram")) {
+                if (CanCopyDirectly(current_scope, "shared.asram")) {
                   src_region = MakeRegionExpr(buffer, aRegion_->region,
                                               /*access_mask=*/1);
                 } else {
@@ -300,7 +404,7 @@ private:
                 auto transfer_buffer = makeNewCompactBufferWithScope(
                     buffer, transfer_region, current_scope);
                 PrimExpr src_region;
-                if (CanDirectConflictCopy(current_scope, "shared.wsram")) {
+                if (CanCopyDirectly(current_scope, "shared.wsram")) {
                   src_region = MakeRegionExpr(buffer, bRegion_->region,
                                               /*access_mask=*/1);
                 } else {
@@ -347,7 +451,7 @@ private:
                 auto transfer_buffer = makeNewCompactBufferWithScope(
                     buffer, transfer_region, current_scope);
                 PrimExpr src_region;
-                if (CanDirectConflictCopy(current_scope, "shared.rsram")) {
+                if (CanCopyDirectly(current_scope, "shared.rsram")) {
                   src_region = MakeRegionExpr(buffer, cRegion_->region,
                                               /*access_mask=*/1);
                 } else {
@@ -442,15 +546,9 @@ private:
     }
     auto buffer = load->buffer;
     if (buffer_remap_.count(buffer)) {
-      auto new_buffer = buffer_remap_[load->buffer];
-      std::string type_key = op->GetTypeKey();
-      return BufferLoad(new_buffer, load->indices);
+      return BufferLoad(buffer_remap_[load->buffer], load->indices);
     } else if (var_remap_.count(buffer->data)) {
-      auto new_buffer = Buffer(
-          var_remap_[buffer->data], buffer->dtype, buffer->shape,
-          buffer->strides, buffer->elem_offset, buffer->name,
-          buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
-      return BufferLoad(new_buffer, load->indices);
+      return BufferLoad(RemapBuffer(buffer), load->indices);
     }
     auto expr = StmtExprMutator::VisitExpr_(op);
     return expr;
@@ -463,14 +561,10 @@ private:
     }
     auto buffer = store->buffer;
     if (buffer_remap_.count(buffer)) {
-      auto new_buffer = buffer_remap_[store->buffer];
-      return BufferStore(new_buffer, store->value, store->indices);
+      return BufferStore(buffer_remap_[store->buffer], store->value,
+                         store->indices);
     } else if (var_remap_.count(buffer->data)) {
-      auto new_buffer = Buffer(
-          var_remap_[buffer->data], buffer->dtype, buffer->shape,
-          buffer->strides, buffer->elem_offset, buffer->name,
-          buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
-      return BufferStore(new_buffer, store->value, store->indices);
+      return BufferStore(RemapBuffer(buffer), store->value, store->indices);
     }
     return store;
   }
@@ -534,6 +628,8 @@ private:
       buffer_source_map_;
 
   std::set<Buffer> buffers_to_infer;
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      original_alloc_buffers_;
 
   bool replace_flag = false;
 

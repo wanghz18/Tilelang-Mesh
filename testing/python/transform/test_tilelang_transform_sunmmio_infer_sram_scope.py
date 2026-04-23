@@ -61,6 +61,18 @@ def extract_buffers_from_kernel(func) -> Set[Buffer]:
     return used_buffers
 
 
+def extract_blocks_from_kernel(func):
+    """Extract all blocks used in a TIR PrimFunc."""
+    blocks = []
+
+    def visit_block(node):
+        if isinstance(node, Block):
+            blocks.append(node)
+
+    post_order_visit(func.body, visit_block)
+    return blocks
+
+
 def extract_block_attrs_from_kernel(func):
     """Extract all block attrs used in a TIR PrimFunc."""
     attrs = []
@@ -1025,18 +1037,6 @@ def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
         assert len(after_gemms) == 7
         assert len(after_copies) == 8
 
-        script = mod.script()
-        expected_copies = [
-            "T.copy(T.region(B[0, 4], 1, 16, 16), T.region(B_shared_1[0, 0], 2, 16, 16))",
-            "T.copy(T.region(B[0, 0], 1, 16, 16), T.region(B_shared_2[0, 0], 2, 16, 16))",
-            "T.copy(T.region(A[0, 4], 1, 16, 16), T.region(A_shared_1[0, 0], 2, 16, 16))",
-            "T.copy(T.region(A[0, 0], 1, 16, 16), T.region(A_shared_2[0, 0], 2, 16, 16))",
-            "T.copy(T.region(C_shared[0, 0], 1, 16, 16), T.region(C_shared_1[0, 0], 2, 16, 16))",
-            "T.copy(T.region(C_shared[0, 4], 1, 16, 16), T.region(C_shared_2[0, 0], 2, 16, 16))",
-        ]
-        for expected_copy in expected_copies:
-            assert expected_copy in script
-
         staged_copy_regions = [copy.args[1] for copy in after_copies[2:]]
         staged_copy_scopes = [region.args[0].buffer.scope() for region in staged_copy_regions]
         assert staged_copy_scopes == [
@@ -1086,3 +1086,56 @@ def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
             assert int(compact_region.args[0].indices[1]) == 0
             assert int(compact_region.args[2]) == 16
             assert int(compact_region.args[3]) == 16
+
+
+def sibling_block_conflict_matmul(dtype="float16", accum_dtype="float32"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((128, 128), dtype),
+        B: T.Tensor((128, 128), dtype),
+        C: T.Tensor((128, 128), accum_dtype),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32, 32), dtype)
+            C_shared = T.alloc_shared((32, 32), accum_dtype)
+
+            with T.block("producer"):
+                T.copy(A[0:32, 0:32], A_shared)
+                T.copy(B[0:32, 0:32], B_shared)
+                T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+
+            with T.block("consumer"):
+                C_shared[0, 0] = C_shared[0, 0] + T.float32(1.0)
+
+    return main
+
+
+def test_tilelang_infer_sram_scope_does_not_leak_temp_alloc_buffers_to_sibling_blocks():
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(sibling_block_conflict_matmul().with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+
+        func = list(mod.functions.values())[0]
+        blocks = {block.name_hint: block for block in extract_blocks_from_kernel(func) if block.name_hint in {"producer", "consumer"}}
+        root_block = next(block for block in extract_blocks_from_kernel(func) if block.name_hint == "tilelang_root")
+        root_scopes = {buf.name: buf.scope() for buf in root_block.alloc_buffers}
+        script = mod.script()
+
+        assert set(blocks.keys()) == {"producer", "consumer"}
+        assert root_scopes["A_shared"] == "shared.asram"
+        assert root_scopes["B_shared"] == "shared.wsram"
+        assert root_scopes["C_shared"] == "shared.rsram"
+        assert len(blocks["consumer"].alloc_buffers) == 0
+        assert all(region.buffer.scope() != "shared.dyn" for region in blocks["producer"].reads)
+        assert all(region.buffer.scope() != "shared.dyn" for region in blocks["consumer"].reads)
+        assert all(region.buffer.scope() == "shared.rsram" for region in blocks["consumer"].reads)
+        assert "C_shared_1 = T.Buffer" not in script

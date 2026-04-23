@@ -159,7 +159,7 @@ def test_inject_sunmmio_sync_mma():
     # wait_token(3)
     # dma_copy(token=4) (store C)
     # wait_token(4)
-    
+
     lines = [l.strip() for l in script.split("\n")]
 
     def extract_token_id(line, marker):

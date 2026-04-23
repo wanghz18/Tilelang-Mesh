@@ -121,6 +121,14 @@ def extract_block_attr_lines(mod):
     return [line.lstrip() for line in mod.script().split("\n") if "T.block_attr" in line]
 
 
+def extract_layout_map(mod):
+    """Extract layout_map entries keyed by buffer name from TIR."""
+    func = list(mod.functions.values())[0]
+    visitor = _DmaCopyVisitor()
+    visitor.visit_stmt(func.body)
+    return visitor.layout_map
+
+
 SIMPLE_COPY_CASES = [
     # (M, N, block_M, block_N)
     (128, 128, 32, 32),
@@ -362,3 +370,5 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         texts = extract_block_attr_lines(mod)
         for text in texts:
             assert '"layout_map"' in text and 'C_shared: metadata["tl.Layout"]' in text
+        layout_map = extract_layout_map(mod)
+        assert "A_shared_rsram_stage" in layout_map

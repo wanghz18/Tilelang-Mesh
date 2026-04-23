@@ -920,6 +920,13 @@ private:
       }
       return workspace.access_ptr(2); // write
     };
+    AddLayoutCallback add_layout = [this](const Buffer &buffer,
+                                          const Layout &layout) {
+      layout_map_.Set(buffer, layout);
+      layout_remap_.Set(buffer, layout);
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+      buffer_map_.insert({buffer->data, buffer});
+    };
 
     Range thread_bounds;
 
@@ -943,7 +950,7 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr,
+                  add_layout, layout_map_, buffer_remap_, let_var_to_expr,
                   global_layout_map_, tileview_map_},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
