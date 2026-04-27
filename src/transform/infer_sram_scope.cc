@@ -98,6 +98,19 @@ struct BufferSourceInfo {
 
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
+  /**
+   * @brief Infer Sunmmio SRAM scopes and rewrite buffers in three explicit
+   * phases.
+   *
+   * Phase 1 collects scope information from GEMM sites and records which shared
+   * buffers still need a default shared.rsram scope.
+   * Phase 2 resolves GEMM scope conflicts by inserting compact temporary copies
+   * where a buffer's assigned scope does not match the scope required by a
+   * specific GEMM operand.
+   * Phase 3 applies the finalized remap to block
+   * metadata and remaining buffer uses so the whole IR becomes internally
+   * consistent.
+   */
   static PrimFunc Substitute(PrimFunc f) {
     arith::Analyzer analyzer;
     InferSramScopePass substituter(&analyzer);
@@ -112,23 +125,36 @@ public:
 
     auto *fptr = f.CopyOnWrite();
 
-    // collect remap info when replace_flag = false
-    substituter.replace_flag = false;
+    // Phase 1 collects buffer usage info and initial scope decisions from the
+    // original IR without rewriting it.
+    substituter.phase_ = Phase::kCollectInfo;
     fptr->body = substituter.VisitStmt(f->body);
 
     substituter.InferUnspecifiedBuffer();
 
+    // Phase 2 inserts GEMM-local compact copies on the original IR. This must
+    // happen before the global remap because the compact regions are derived
+    // from the original operand coordinates.
+    substituter.phase_ = Phase::kResolveConflicts;
+    fptr->body = substituter.VisitStmt(f->body);
+
     fptr->body =
         RemapBufferRewriter::Substitute(fptr->body, substituter.buffer_remap_);
 
-    // do remap when replace_flag = true
-    substituter.replace_flag = true;
+    // Phase 3 rewrites block metadata and any remaining buffer references to
+    // match the remapped buffers chosen in phases 1 and 2.
+    substituter.phase_ = Phase::kRewriteScope;
     fptr->body = substituter.VisitStmt(f->body);
     return f;
   }
 
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
+  enum class Phase {
+    kCollectInfo,
+    kResolveConflicts,
+    kRewriteScope,
+  };
 
   class LocalBufferUseCollector : public StmtExprVisitor {
   public:
@@ -140,12 +166,6 @@ private:
     }
 
   private:
-    void VisitStmt_(const BlockRealizeNode *op) final {
-      /** @brief Nested blocks own their own alloc_buffers, so skip them here.
-       */
-      return;
-    }
-
     void VisitStmt_(const BufferStoreNode *op) final {
       used_buffer_vars_.insert(op->buffer->data.get());
       StmtExprVisitor::VisitStmt_(op);
@@ -177,6 +197,12 @@ private:
             dst_scope == "shared.rsram");
   }
 
+  bool InInfoCollectionPhase() const { return phase_ == Phase::kCollectInfo; }
+  bool InConflictResolutionPhase() const {
+    return phase_ == Phase::kResolveConflicts;
+  }
+  bool InScopeRewritePhase() const { return phase_ == Phase::kRewriteScope; }
+
   Buffer RemapBuffer(const Buffer &buffer) {
     if (buffer_remap_.count(buffer)) {
       return buffer_remap_[buffer];
@@ -199,35 +225,25 @@ private:
                              RemapBufferRegion(match->source));
   }
 
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
-    BlockRealize block_realize =
-        Downcast<BlockRealize>(StmtExprMutator::VisitStmt_(op));
-    Block block = block_realize->block;
-    // remap shared buffers to rsram buffers by default
-    if (!replace_flag) {
-      Array<Buffer> alloc_buffers = block->alloc_buffers;
-      for (auto buffer : alloc_buffers) {
-        if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
-          buffers_to_infer.insert(buffer);
-          original_alloc_buffers_.insert(buffer);
-        } else if ((buffer.scope() != "shared.asram") &&
-                   (buffer.scope() != "shared.wsram") &&
-                   (buffer.scope() != "shared.rsram")) {
-          // sram type has validated in GEMM node
-          ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
-                    << " in Sunmmio.";
-        }
+  void CollectOriginalSharedAllocations(const Block &block) {
+    for (const Buffer &buffer : block->alloc_buffers) {
+      if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+        buffers_to_infer.insert(buffer);
+        original_alloc_buffers_.insert(buffer);
+      } else if ((buffer.scope() != "shared.asram") &&
+                 (buffer.scope() != "shared.wsram") &&
+                 (buffer.scope() != "shared.rsram")) {
+        // SRAM scopes should already have been validated at the GEMM sites.
+        ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
+                  << " in Sunmmio.";
       }
-      return block_realize;
     }
+  }
 
-    if (buffer_remap_.empty()) {
-      return block_realize;
-    }
-
-    // do block attributes remap
-    if (block->annotations.count(attr::kLayoutMap)) {
-      auto map = block->annotations.Get(attr::kLayoutMap)
+  void RewriteBlockAnnotations(Block *block_ptr) {
+    if ((*block_ptr)->annotations.count(attr::kLayoutMap)) {
+      auto map = (*block_ptr)
+                     ->annotations.Get(attr::kLayoutMap)
                      ->as<Map<Var, Layout>>()
                      .value();
       Map<Var, Layout> new_map;
@@ -238,11 +254,12 @@ private:
           new_map.Set(var, layout);
         }
       }
-      block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, new_map);
+      (*block_ptr).CopyOnWrite()->annotations.Set(attr::kLayoutMap, new_map);
     }
 
-    if (block->annotations.count(attr::kTileViewMap)) {
-      auto map = block->annotations.Get(attr::kTileViewMap)
+    if ((*block_ptr)->annotations.count(attr::kTileViewMap)) {
+      auto map = (*block_ptr)
+                     ->annotations.Get(attr::kTileViewMap)
                      ->as<Map<Var, TileView>>()
                      .value();
       Map<Var, TileView> new_map;
@@ -253,31 +270,33 @@ private:
           new_map.Set(var, tileView);
         }
       }
-      block.CopyOnWrite()->annotations.Set(attr::kTileViewMap, new_map);
+      (*block_ptr).CopyOnWrite()->annotations.Set(attr::kTileViewMap, new_map);
     }
+  }
 
+  void RewriteBlockBuffers(Block *block_ptr) {
     Array<BufferRegion> reads;
-    reads.reserve(block->reads.size());
-    for (const BufferRegion &region : block->reads) {
+    reads.reserve((*block_ptr)->reads.size());
+    for (const BufferRegion &region : (*block_ptr)->reads) {
       reads.push_back(RemapBufferRegion(region));
     }
 
     Array<BufferRegion> writes;
-    writes.reserve(block->writes.size());
-    for (const BufferRegion &region : block->writes) {
+    writes.reserve((*block_ptr)->writes.size());
+    for (const BufferRegion &region : (*block_ptr)->writes) {
       writes.push_back(RemapBufferRegion(region));
     }
 
     Array<MatchBufferRegion> match_buffers;
-    match_buffers.reserve(block->match_buffers.size());
-    for (const MatchBufferRegion &match : block->match_buffers) {
+    match_buffers.reserve((*block_ptr)->match_buffers.size());
+    for (const MatchBufferRegion &match : (*block_ptr)->match_buffers) {
       match_buffers.push_back(RemapMatchBufferRegion(match));
     }
 
     /** @brief Remap block-local allocations and add only block-local
      * temporaries. */
     Array<Buffer> alloc_buffers;
-    for (const Buffer &buf : block->alloc_buffers) {
+    for (const Buffer &buf : (*block_ptr)->alloc_buffers) {
       if (buffer_remap_.find(buf) != buffer_remap_.end()) {
         alloc_buffers.push_back(buffer_remap_.at(buf));
       } else {
@@ -294,7 +313,7 @@ private:
     }
 
     std::unordered_set<const VarNode *> used_buffer_vars =
-        LocalBufferUseCollector::Collect(block->body);
+        LocalBufferUseCollector::Collect((*block_ptr)->body);
     for (const VarNode *buf_var : used_buffer_vars) {
       auto it = remapped_buffers_by_var.find(buf_var);
       if (it == remapped_buffers_by_var.end()) {
@@ -307,218 +326,177 @@ private:
       }
     }
 
-    if (!alloc_buffers.same_as(block->alloc_buffers)) {
-      block.CopyOnWrite()->alloc_buffers = alloc_buffers;
+    if (!alloc_buffers.same_as((*block_ptr)->alloc_buffers)) {
+      (*block_ptr).CopyOnWrite()->alloc_buffers = alloc_buffers;
     }
-    if (!reads.same_as(block->reads)) {
-      block.CopyOnWrite()->reads = reads;
+    if (!reads.same_as((*block_ptr)->reads)) {
+      (*block_ptr).CopyOnWrite()->reads = reads;
     }
-    if (!writes.same_as(block->writes)) {
-      block.CopyOnWrite()->writes = writes;
+    if (!writes.same_as((*block_ptr)->writes)) {
+      (*block_ptr).CopyOnWrite()->writes = writes;
     }
-    if (!match_buffers.same_as(block->match_buffers)) {
-      block.CopyOnWrite()->match_buffers = match_buffers;
+    if (!match_buffers.same_as((*block_ptr)->match_buffers)) {
+      (*block_ptr).CopyOnWrite()->match_buffers = match_buffers;
     }
+  }
+
+  void CollectOperandScope(const BufferRegion &region,
+                           const std::string &expected_scope) {
+    Buffer buffer = region->buffer;
+    if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+      if (!buffer_remap_.count(buffer)) {
+        buffer_remap_.Set(buffer, makeBufferWithScope(buffer, expected_scope));
+      }
+      return;
+    }
+
+    if (buffer.scope() != expected_scope) {
+      ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
+                << buffer << " in GEMM Sunmmio.";
+    }
+  }
+
+  PrimExpr MakeConflictCopySource(const Buffer &buffer,
+                                  const Array<Range> &requested_region,
+                                  const std::string &current_scope,
+                                  const std::string &expected_scope,
+                                  const char *operand_name) {
+    if (CanCopyDirectly(current_scope, expected_scope)) {
+      return MakeRegionExpr(buffer, requested_region, /*access_mask=*/1);
+    }
+
+    auto maybe_source_region =
+        TryTranslateSourceRegion(buffer, requested_region);
+    ICHECK(maybe_source_region.defined())
+        << "Cannot resolve source for conflicting " << operand_name
+        << " operand " << buffer << ".";
+    return MakeRegionExpr(maybe_source_region.value()->buffer,
+                          maybe_source_region.value()->region,
+                          /*access_mask=*/1);
+  }
+
+  void
+  ResolveOperandConflict(const BufferRegion &region, const char *operand_name,
+                         const char *operand_key,
+                         const std::string &expected_scope, Array<Stmt> *seq,
+                         std::unordered_map<std::string, PrimExpr> *new_args) {
+    Buffer buffer = region->buffer;
+    if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+      if (!buffer_remap_.count(buffer)) {
+        return;
+      }
+      std::string current_scope = buffer_remap_[buffer].scope();
+      if (current_scope != expected_scope) {
+        auto transfer_region = MakeCompactRegion(region->region);
+        auto transfer_buffer = makeNewCompactBufferWithScope(
+            buffer, transfer_region, current_scope);
+        PrimExpr src_region =
+            MakeConflictCopySource(buffer, region->region, current_scope,
+                                   expected_scope, operand_name);
+        PrimExpr dst_region =
+            MakeRegionExpr(transfer_buffer, transfer_region, /*access_mask=*/2);
+        Call copy_call =
+            Call(DataType::Handle(), Copy::Get(), {src_region, dst_region}, {});
+        seq->push_back(Evaluate(copy_call));
+        buffer_remap_.Set(transfer_buffer,
+                          makeBufferWithScope(transfer_buffer, expected_scope));
+        new_args->insert(
+            {operand_key, MakeRegionExpr(transfer_buffer, transfer_region, 1)});
+      }
+      return;
+    }
+
+    if (buffer.scope() != expected_scope) {
+      ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
+                << buffer << " in GEMM Sunmmio.";
+    }
+  }
+
+  void CollectGemmScopes(const CallNode *call) {
+    CollectOperandScope(NormalizeToBufferRegion(call->args[0]), "shared.asram");
+    CollectOperandScope(NormalizeToBufferRegion(call->args[1]), "shared.wsram");
+    CollectOperandScope(NormalizeToBufferRegion(call->args[2]), "shared.rsram");
+  }
+
+  Stmt ResolveGemmConflicts(const CallNode *call) {
+    auto a_region = NormalizeToBufferRegion(call->args[0]);
+    auto b_region = NormalizeToBufferRegion(call->args[1]);
+    auto c_region = NormalizeToBufferRegion(call->args[2]);
+
+    Array<Stmt> seq;
+    std::unordered_map<std::string, PrimExpr> new_args;
+
+    ResolveOperandConflict(a_region, "A", "A", "shared.asram", &seq, &new_args);
+    ResolveOperandConflict(b_region, "B", "B", "shared.wsram", &seq, &new_args);
+    ResolveOperandConflict(c_region, "C", "C", "shared.rsram", &seq, &new_args);
+
+    if (seq.empty() || new_args.empty()) {
+      return Evaluate(tvm::ffi::GetRef<Call>(call));
+    }
+
+    ICHECK_EQ(call->args.size(), 19U) << "GEMM should have 19 parameters.";
+    Array<PrimExpr> new_gemm_args;
+    new_gemm_args.push_back(new_args.count("A") ? new_args.at("A")
+                                                : call->args[0]);
+    new_gemm_args.push_back(new_args.count("B") ? new_args.at("B")
+                                                : call->args[1]);
+    new_gemm_args.push_back(new_args.count("C") ? new_args.at("C")
+                                                : call->args[2]);
+    for (size_t i = 3; i < call->args.size(); ++i) {
+      new_gemm_args.push_back(call->args[i]);
+    }
+    seq.push_back(Evaluate(Call(DataType::Handle(), call->op, new_gemm_args)));
+    return SeqStmt::Flatten(seq);
+  }
+
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    BlockRealize block_realize =
+        Downcast<BlockRealize>(StmtExprMutator::VisitStmt_(op));
+    Block block = block_realize->block;
+    if (InInfoCollectionPhase()) {
+      // Phase 1 only records which original block allocations still need a
+      // default shared.rsram scope if GEMM did not assign them explicitly.
+      CollectOriginalSharedAllocations(block);
+      return block_realize;
+    }
+
+    if (InConflictResolutionPhase()) {
+      return block_realize;
+    }
+
+    if (buffer_remap_.empty()) {
+      return block_realize;
+    }
+
+    RewriteBlockAnnotations(&block);
+    RewriteBlockBuffers(&block);
     block_realize.CopyOnWrite()->block = block;
 
     return block_realize;
   }
 
-  Stmt VisitStmt_(const ForNode *op) final {
-    auto loop = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    if (!replace_flag) {
-      return loop;
-    }
-    return loop;
-  }
-
   Stmt VisitStmt_(const EvaluateNode *op) final {
-    // collect remap info in gemm nodes
-    if (!replace_flag) {
+    if (InInfoCollectionPhase()) {
       if (const auto *call = op->value.as<CallNode>()) {
         if (call->op.same_as(Op::Get("tl.tileop.gemm")) ||
             call->op.same_as(Op::Get("tl.tileop.gemm_py"))) {
-          auto aRegion_ = NormalizeToBufferRegion(call->args[0]);
-          auto bRegion_ = NormalizeToBufferRegion(call->args[1]);
-          auto cRegion_ = NormalizeToBufferRegion(call->args[2]);
-
-          Array<Stmt> seq;
-          std::unordered_map<std::string, PrimExpr> new_args;
-
-          auto buffer = aRegion_->buffer;
-          if ((buffer.scope() == "shared") ||
-              (buffer.scope() == "shared.dyn")) {
-            if (buffer_remap_.count(buffer)) {
-              std::string current_scope = buffer_remap_[buffer].scope();
-              if (current_scope != "shared.asram") {
-                // insert a copy stmt
-                auto transfer_region = MakeCompactRegion(aRegion_->region);
-                auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, current_scope);
-                PrimExpr src_region;
-                if (CanCopyDirectly(current_scope, "shared.asram")) {
-                  src_region = MakeRegionExpr(buffer, aRegion_->region,
-                                              /*access_mask=*/1);
-                } else {
-                  auto maybe_source_region =
-                      TryTranslateSourceRegion(buffer, aRegion_->region);
-                  ICHECK(maybe_source_region.defined())
-                      << "Cannot resolve source for conflicting A operand "
-                      << buffer << ".";
-                  src_region =
-                      MakeRegionExpr(maybe_source_region.value()->buffer,
-                                     maybe_source_region.value()->region,
-                                     /*access_mask=*/1);
-                }
-                PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, transfer_region, /*access_mask=*/2);
-                Call copy_call = Call(DataType::Handle(), Copy::Get(),
-                                      {src_region, dst_region}, {});
-                seq.push_back(Evaluate(copy_call));
-                buffer_remap_.Set(
-                    transfer_buffer,
-                    makeBufferWithScope(transfer_buffer, "shared.asram"));
-
-                new_args.insert(
-                    {"A", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
-              }
-            } else {
-              auto remap_buffer =
-                  makeBufferWithScope(aRegion_->buffer, "shared.asram");
-              buffer_remap_.Set(buffer, remap_buffer);
-            }
-          } else if (buffer.scope() != "shared.asram") {
-            // incorrect specification
-            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
-                      << buffer << " in GEMM Sunmmio.";
-          }
-
-          buffer = bRegion_->buffer;
-          if ((buffer.scope() == "shared") ||
-              (buffer.scope() == "shared.dyn")) {
-            if (buffer_remap_.count(buffer)) {
-              std::string current_scope = buffer_remap_[buffer].scope();
-              if (current_scope != "shared.wsram") {
-                // insert a copy stmt
-                auto transfer_region = MakeCompactRegion(bRegion_->region);
-                auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, current_scope);
-                PrimExpr src_region;
-                if (CanCopyDirectly(current_scope, "shared.wsram")) {
-                  src_region = MakeRegionExpr(buffer, bRegion_->region,
-                                              /*access_mask=*/1);
-                } else {
-                  auto maybe_source_region =
-                      TryTranslateSourceRegion(buffer, bRegion_->region);
-                  ICHECK(maybe_source_region.defined())
-                      << "Cannot resolve source for conflicting B operand "
-                      << buffer << ".";
-                  src_region =
-                      MakeRegionExpr(maybe_source_region.value()->buffer,
-                                     maybe_source_region.value()->region,
-                                     /*access_mask=*/1);
-                }
-                PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, transfer_region, /*access_mask=*/2);
-                Call copy_call = Call(DataType::Handle(), Copy::Get(),
-                                      {src_region, dst_region}, {});
-                seq.push_back(Evaluate(copy_call));
-                buffer_remap_.Set(
-                    transfer_buffer,
-                    makeBufferWithScope(transfer_buffer, "shared.wsram"));
-
-                new_args.insert(
-                    {"B", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
-              }
-            } else {
-              auto remap_buffer =
-                  makeBufferWithScope(bRegion_->buffer, "shared.wsram");
-              buffer_remap_.Set(buffer, remap_buffer);
-            }
-          } else if (buffer.scope() != "shared.wsram") {
-            // incorrect specification
-            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
-                      << buffer << " in GEMM Sunmmio.";
-          }
-
-          buffer = cRegion_->buffer;
-          if ((buffer.scope() == "shared") ||
-              (buffer.scope() == "shared.dyn")) {
-            if (buffer_remap_.count(buffer)) {
-              std::string current_scope = buffer_remap_[buffer].scope();
-              if (current_scope != "shared.rsram") { // insert a copy stmt
-                auto transfer_region = MakeCompactRegion(cRegion_->region);
-                auto transfer_buffer = makeNewCompactBufferWithScope(
-                    buffer, transfer_region, current_scope);
-                PrimExpr src_region;
-                if (CanCopyDirectly(current_scope, "shared.rsram")) {
-                  src_region = MakeRegionExpr(buffer, cRegion_->region,
-                                              /*access_mask=*/1);
-                } else {
-                  auto maybe_source_region =
-                      TryTranslateSourceRegion(buffer, cRegion_->region);
-                  ICHECK(maybe_source_region.defined())
-                      << "Cannot resolve source for conflicting C operand "
-                      << buffer << ".";
-                  src_region =
-                      MakeRegionExpr(maybe_source_region.value()->buffer,
-                                     maybe_source_region.value()->region,
-                                     /*access_mask=*/1);
-                }
-                PrimExpr dst_region = MakeRegionExpr(
-                    transfer_buffer, transfer_region, /*access_mask=*/2);
-                Call copy_call = Call(DataType::Handle(), Copy::Get(),
-                                      {src_region, dst_region}, {});
-                seq.push_back(Evaluate(copy_call));
-                buffer_remap_.Set(
-                    transfer_buffer,
-                    makeBufferWithScope(transfer_buffer, "shared.rsram"));
-
-                new_args.insert(
-                    {"C", MakeRegionExpr(transfer_buffer, transfer_region, 1)});
-              }
-            } else {
-              auto remap_buffer =
-                  makeBufferWithScope(cRegion_->buffer, "shared.rsram");
-              buffer_remap_.Set(buffer, remap_buffer);
-            }
-          } else if (buffer.scope() != "shared.rsram") {
-            // incorrect specification
-            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
-                      << buffer << " in GEMM Sunmmio.";
-          }
-
-          if (!seq.empty() && !new_args.empty()) {
-            auto gemm_call = call;
-            ICHECK(gemm_call->args.size() == 19)
-                << "GEMM should have 19 parameters.";
-            Array<PrimExpr> new_gemm_args;
-            auto it = new_args.find("A");
-            if (it != new_args.end()) {
-              new_gemm_args.push_back(it->second);
-            } else {
-              new_gemm_args.push_back(gemm_call->args[0]);
-            }
-            it = new_args.find("B");
-            if (it != new_args.end()) {
-              new_gemm_args.push_back(it->second);
-            } else {
-              new_gemm_args.push_back(gemm_call->args[1]);
-            }
-            it = new_args.find("C");
-            if (it != new_args.end()) {
-              new_gemm_args.push_back(it->second);
-            } else {
-              new_gemm_args.push_back(gemm_call->args[2]);
-            }
-            for (auto i = 3; i < gemm_call->args.size(); i++) {
-              new_gemm_args.push_back(gemm_call->args[i]);
-            }
-            Call new_gemm(DataType::Handle(), call->op, new_gemm_args);
-            seq.push_back(Evaluate(new_gemm));
-            return SeqStmt::Flatten(seq);
-          }
+          CollectGemmScopes(call);
           return tvm::ffi::GetRef<Stmt>(op);
+        }
+      }
+    }
+    if (InConflictResolutionPhase()) {
+      if (const auto *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(Op::Get("tl.tileop.gemm")) ||
+            call->op.same_as(Op::Get("tl.tileop.gemm_py"))) {
+          /**
+           * @brief Phase 2 only resolves GEMM scope conflicts.
+           *
+           * The compact copy is inserted here, before the global remap, so the
+           * copy source region can still be derived from the original buffer
+           * coordinates collected in phase 1.
+           */
+          return ResolveGemmConflicts(call);
         }
       }
     }
@@ -527,7 +505,7 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
-    if (!replace_flag) {
+    if (InInfoCollectionPhase()) {
       auto buffer = load->buffer;
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         if (buffer_remap_.count(buffer)) {
@@ -556,7 +534,7 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    if (!replace_flag) {
+    if (!InScopeRewritePhase()) {
       return store;
     }
     auto buffer = store->buffer;
@@ -570,7 +548,7 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (!replace_flag) {
+    if (InInfoCollectionPhase()) {
       auto tile_op = ParseOperator(tvm::ffi::GetRef<Call>(op));
       if (auto *copy = tile_op.as<CopyNode>()) {
         if (copy->dst.defined() && copy->src.defined() &&
@@ -587,7 +565,7 @@ private:
 
   PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = tvm::ffi::GetRef<Var>(op);
-    if (!replace_flag) {
+    if (!InScopeRewritePhase()) {
       return std::move(var);
     }
     if (var_remap_.count(var)) {
@@ -631,7 +609,7 @@ private:
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
       original_alloc_buffers_;
 
-  bool replace_flag = false;
+  Phase phase_ = Phase::kCollectInfo;
 
   Optional<BufferRegion>
   TryTranslateSourceRegion(const Buffer &buffer,
