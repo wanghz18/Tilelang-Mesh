@@ -920,6 +920,7 @@ private:
       }
       return workspace.access_ptr(2); // write
     };
+
     Range thread_bounds;
 
     if (analyzer_->const_int_bound.IsBound(thread_var_->var)) {
