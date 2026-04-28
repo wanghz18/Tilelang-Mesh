@@ -91,7 +91,8 @@ private:
     size_t src_dim = 0;
     size_t dst_dim = 0;
 
-    while (src_dim < copy->src_range.size() && dst_dim < copy->dst_range.size()) {
+    while (src_dim < copy->src_range.size() &&
+           dst_dim < copy->dst_range.size()) {
       while (src_dim < copy->src_range.size() &&
              is_one(copy->src_range[src_dim]->extent)) {
         ++src_dim;
@@ -101,7 +102,8 @@ private:
         ++dst_dim;
       }
 
-      if (src_dim >= copy->src_range.size() || dst_dim >= copy->dst_range.size()) {
+      if (src_dim >= copy->src_range.size() ||
+          dst_dim >= copy->dst_range.size()) {
         break;
       }
 
@@ -116,13 +118,15 @@ private:
 
     while (src_dim < copy->src_range.size()) {
       ICHECK(is_one(copy->src_range[src_dim]->extent))
-          << "Sunmmio staged copy found an unmatched non-unit src extent at dim "
+          << "Sunmmio staged copy found an unmatched non-unit src extent at "
+             "dim "
           << src_dim << ": " << copy->src_range[src_dim]->extent;
       ++src_dim;
     }
     while (dst_dim < copy->dst_range.size()) {
       ICHECK(is_one(copy->dst_range[dst_dim]->extent))
-          << "Sunmmio staged copy found an unmatched non-unit dst extent at dim "
+          << "Sunmmio staged copy found an unmatched non-unit dst extent at "
+             "dim "
           << dst_dim << ": " << copy->dst_range[dst_dim]->extent;
       ++dst_dim;
     }

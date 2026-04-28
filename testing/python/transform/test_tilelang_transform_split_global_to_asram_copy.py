@@ -72,9 +72,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal, groups=1, block_M=64, block
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = (
-                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
-                if is_causal
-                else T.ceildiv(seq_len, block_N)
+                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N)
             )
 
             for k in T.Pipelined(loop_range, num_stages=num_stages):
@@ -214,9 +212,7 @@ def test_split_global_to_asram_copy_on_gemm_kernel():
     assert stage_buffers[0].scope() == "shared.rsram"
     assert [int(dim) for dim in stage_buffers[0].shape] == [32, 32]
 
-    a_global_to_stage = [
-        edge for edge in copy_edges if edge["src_name"] == "A" and edge["dst_name"].startswith("A_shared_rsram_stage")
-    ]
+    a_global_to_stage = [edge for edge in copy_edges if edge["src_name"] == "A" and edge["dst_name"].startswith("A_shared_rsram_stage")]
     a_stage_to_asram = [
         edge for edge in copy_edges if edge["src_name"].startswith("A_shared_rsram_stage") and edge["dst_name"] == "A_shared"
     ]
@@ -263,9 +259,7 @@ def test_split_global_to_asram_copy_on_flashattn_kernel():
     stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.startswith("Q_shared_rsram_stage")]
     k_direct_copies = [edge for edge in copy_edges if edge["src_name"] == "K" and edge["dst_name"] == "K_shared"]
     v_direct_copies = [edge for edge in copy_edges if edge["src_name"] == "V" and edge["dst_name"] == "V_shared"]
-    q_global_to_stage = [
-        edge for edge in copy_edges if edge["src_name"] == "Q" and edge["dst_name"].startswith("Q_shared_rsram_stage")
-    ]
+    q_global_to_stage = [edge for edge in copy_edges if edge["src_name"] == "Q" and edge["dst_name"].startswith("Q_shared_rsram_stage")]
     q_stage_to_asram = [
         edge for edge in copy_edges if edge["src_name"].startswith("Q_shared_rsram_stage") and edge["dst_name"] == "Q_shared"
     ]
