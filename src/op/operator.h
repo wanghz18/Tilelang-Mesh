@@ -24,7 +24,6 @@ namespace tl {
 using namespace tir;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
-using AddLayoutCallback = std::function<void(const Buffer &, const Layout &)>;
 using LayoutMap = Map<Buffer, Layout>;
 using TileViewMap = Map<Var, TileView>;
 using BufferMap = Map<Var, Buffer>;
@@ -54,7 +53,6 @@ struct LowerArgs {
   Range thread_bounds;
   Var thread_var;
   AddWorkspaceCallback AddWorkspace;
-  AddLayoutCallback AddLayout;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
   // Map from LetStmt variable to its bound expression, for resolving
