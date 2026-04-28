@@ -805,7 +805,8 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
   /** The staging split is handled by SplitGlobalToAsramCopy before lowering. */
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
-  return Evaluate(Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
+  return Evaluate(
+      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
