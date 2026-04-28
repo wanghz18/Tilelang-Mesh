@@ -176,6 +176,9 @@ def run_lower_and_legalize_cascade(mod, target):
     mod = tl_transform.InferSramScope()(mod)
     assert_threadless_invariants(mod, "InferSramScope")
 
+    mod = tl_transform.SplitGlobalToAsramCopy()(mod)
+    assert_threadless_invariants(mod, "SplitGlobalToAsramCopy")
+
     mod = tl_transform.LayoutReducer()(mod)
     assert_threadless_invariants(mod, "LayoutReducer")
 

@@ -125,7 +125,6 @@ def run_split_global_to_asram_copy(mod, target):
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.SplitGlobalToAsramCopy()(mod)
-    print(mod)
     return mod
 
 

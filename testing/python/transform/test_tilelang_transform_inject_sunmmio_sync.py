@@ -73,6 +73,7 @@ def apply_sunmmio_lowering(mod, target):
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.SplitGlobalToAsramCopy()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
