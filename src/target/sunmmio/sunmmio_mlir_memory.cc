@@ -52,9 +52,19 @@ SunMMIOValue SunmmioMlirMemory::Load(const std::string &result_name,
   (void)buffer_handle;
   (void)indices;
   (void)memref_type;
-  SunMMIOValue out{dtype, result_name, result_type};
-  // ctx_.value_symbol_table[result_name] = out;
-  return out;
+  ICHECK(ctx_.module)
+      << "MLIR module must be initialized before lowering Sunmmio memory ops";
+  mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
+      mlir::Type::getFromOpaquePointer(
+          ctx_.builder.getF32Type().getAsOpaquePointer()),
+      0);
+  auto fake_op = mlir::arith::ConstantOp::create(
+      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_load"),
+      value_attr);
+  fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("load"));
+  mlir::Value load_value = fake_op.getResult();
+  ctx_.BindMLIRValue(result_name, load_value);
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 void SunmmioMlirMemory::Store(const SunMMIOValue &value,

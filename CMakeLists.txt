@@ -504,6 +504,7 @@ if(TARGET MLIRIR)
     MLIRMemRefDialect
     MLIRControlFlowDialect
     MLIRAffineDialect
+    MLIRVectorDialect
   )
   if(TARGET SUVMIR)
     target_link_libraries(tilelang PRIVATE SUVMIR)
