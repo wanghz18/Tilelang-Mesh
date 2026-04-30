@@ -70,7 +70,7 @@ def InferSramScope():
     return _ffi_api.InferSramScope()  # type: ignore
 
 
-def SplitGlobalToAsramCopy():
+def LegalizeSunmmioCopyPath():
     """Split Sunmmio global->asram copies into staged rsram copies.
 
     Returns
@@ -78,7 +78,7 @@ def SplitGlobalToAsramCopy():
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.SplitGlobalToAsramCopy()  # type: ignore
+    return _ffi_api.LegalizeSunmmioCopyPath()  # type: ignore
 
 
 def LowerTileOp():

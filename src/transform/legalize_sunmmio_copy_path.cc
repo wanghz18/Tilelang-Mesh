@@ -1,7 +1,6 @@
 /*!
- * \file split_global_to_asram_copy.cc
- * \brief Split Sunmmio global->asram copies into global->rsram and
- *        rsram->asram copies.
+ * \file legalize_sunmmio_copy_path.cc
+ * \brief Legalize unsupported Sunmmio copy paths.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -55,13 +54,13 @@ Buffer MakeCompactBufferWithScope(const Buffer &buffer,
                 buffer->buffer_type);
 }
 
-class SplitGlobalToAsramCopyPass : public arith::IRMutatorWithAnalyzer {
+class LegalizeSunmmioCopyPathPass : public arith::IRMutatorWithAnalyzer {
 public:
-  explicit SplitGlobalToAsramCopyPass(arith::Analyzer *analyzer)
+  explicit LegalizeSunmmioCopyPathPass(arith::Analyzer *analyzer)
       : arith::IRMutatorWithAnalyzer(analyzer) {}
 
   /**
-   * @brief Split each Sunmmio global->asram tile copy before lowering.
+   * @brief Legalize unsupported Sunmmio copy paths before lowering.
    *
    * The pass inserts a compact shared.rsram temporary buffer into the nearest
    * enclosing block allocation list, then rewrites one `tl.tileop.copy`
@@ -76,7 +75,7 @@ public:
     }
 
     arith::Analyzer analyzer;
-    SplitGlobalToAsramCopyPass rewriter(&analyzer);
+    LegalizeSunmmioCopyPathPass rewriter(&analyzer);
     auto *fptr = f.CopyOnWrite();
     fptr->body = rewriter.VisitStmt(f->body);
     return f;
@@ -134,7 +133,7 @@ private:
 
   Buffer CreateStageBuffer(const Copy &copy) {
     ICHECK(!alloc_buffer_stack_.empty())
-        << "SplitGlobalToAsramCopy expects copies to appear inside a block.";
+        << "LegalizeSunmmioCopyPath expects copies to appear inside a block.";
     Array<Range> temp_region = MakeCompactRegionForStage(copy->dst_range);
     std::string name = copy->dst->name + "_rsram_stage";
     if (temp_buffer_counter_ != 0) {
@@ -199,17 +198,17 @@ private:
   int temp_buffer_counter_ = 0;
 };
 
-Pass SplitGlobalToAsramCopy() {
+Pass LegalizeSunmmioCopyPath() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
-    return SplitGlobalToAsramCopyPass::Substitute(std::move(f));
+    return LegalizeSunmmioCopyPathPass::Substitute(std::move(f));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.SplitGlobalToAsramCopy", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.LegalizeSunmmioCopyPath", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.SplitGlobalToAsramCopy",
-                        SplitGlobalToAsramCopy);
+  refl::GlobalDef().def("tl.transform.LegalizeSunmmioCopyPath",
+                        LegalizeSunmmioCopyPath);
 }
 
 } // namespace tl

@@ -1,4 +1,4 @@
-"""Tests for the Sunmmio SplitGlobalToAsramCopy pass."""
+"""Tests for the Sunmmio LegalizeSunmmioCopyPath pass."""
 
 import tilelang
 import tilelang.language as T
@@ -113,8 +113,8 @@ def flashattn(batch, heads, seq_len, dim, is_causal, groups=1, block_M=64, block
     return tvm.IRModule({"main": main})
 
 
-def run_split_global_to_asram_copy(mod, target):
-    """Apply the real pre-split pipeline before running SplitGlobalToAsramCopy."""
+def run_legalize_sunmmio_copy_path(mod, target):
+    """Apply the real pre-split pipeline before running LegalizeSunmmioCopyPath."""
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
@@ -122,7 +122,7 @@ def run_split_global_to_asram_copy(mod, target):
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.SplitGlobalToAsramCopy()(mod)
+    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
     return mod
 
 
@@ -196,11 +196,11 @@ def extract_copy_edges(func):
     return edges
 
 
-def test_split_global_to_asram_copy_on_gemm_kernel():
+def test_legalize_sunmmio_copy_path_on_gemm_kernel():
     target = determine_target("Sunmmio", return_object=True)
 
     with tvm.target.Target(target):
-        mod = run_split_global_to_asram_copy(gemm_matmul(128, 128, 128, 32, 32, 32), target)
+        mod = run_legalize_sunmmio_copy_path(gemm_matmul(128, 128, 128, 32, 32, 32), target)
 
     func = mod["main"]
     root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
@@ -244,11 +244,11 @@ def test_split_global_to_asram_copy_on_gemm_kernel():
     assert b_direct_copy[0]["dst_access_mask"] == 2
 
 
-def test_split_global_to_asram_copy_on_flashattn_kernel():
+def test_legalize_sunmmio_copy_path_on_flashattn_kernel():
     target = determine_target("Sunmmio", return_object=True)
 
     with tvm.target.Target(target):
-        mod = run_split_global_to_asram_copy(
+        mod = run_legalize_sunmmio_copy_path(
             flashattn(1, 4, 128, 32, False, groups=1, block_M=32, block_N=32, num_stages=1, threads=128),
             target,
         )

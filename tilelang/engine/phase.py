@@ -175,7 +175,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Infer shared memory SRAM scope
     mod = tilelang.transform.InferSramScope()(mod)
     # Split Sunmmio global->asram copies before layout inference and tile-op lowering
-    mod = tilelang.transform.SplitGlobalToAsramCopy()(mod)
+    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Infer memory layouts for fragments and shared memory
