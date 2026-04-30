@@ -3,6 +3,7 @@
 
 #include "sunmmio_mlir_type.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -58,6 +59,25 @@ struct SunmmioMlirContext {
       }
     }
     return mlir::Value();
+  }
+
+  mlir::Value LookupOrCreateFakeValue(const SunMMIOValue &value,
+                                      const std::string &debug_tag) {
+    mlir::Value existing = LookupMLIRValue(value.value);
+    if (existing) {
+      return existing;
+    }
+
+    auto fake_op = mlir::arith::ConstantIntOp::create(
+        builder, SunmmioMlirType(*this).MakeDebugLoc(debug_tag), 0, 32);
+    std::string attr_str =
+        debug_tag + (value.value.empty() ? "" : ":" + value.value);
+    fake_op->setAttr("sunmmio.fake", builder.getStringAttr(attr_str));
+    mlir::Value fake_value = fake_op.getResult();
+    if (!value.value.empty()) {
+      BindMLIRValue(value.value, fake_value);
+    }
+    return fake_value;
   }
 
   void BindMLIRValue(const std::string &name, mlir::Value v) {

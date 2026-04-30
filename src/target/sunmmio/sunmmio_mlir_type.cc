@@ -2,6 +2,7 @@
 
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "sunmmio_mlir_context.h"
 #include "tvm/runtime/logging.h"
 
@@ -84,6 +85,11 @@ SunmmioMlirType::SunmmioMlirType(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 
 mlir::Location SunmmioMlirType::Loc() const {
   return ctx_.builder.getUnknownLoc();
+}
+
+mlir::Location SunmmioMlirType::MakeDebugLoc(const std::string &tag) const {
+  return mlir::NameLoc::get(ctx_.builder.getStringAttr(tag),
+                            ctx_.builder.getUnknownLoc());
 }
 
 mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {

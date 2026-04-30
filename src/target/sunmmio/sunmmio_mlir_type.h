@@ -86,6 +86,7 @@ public:
   explicit SunmmioMlirType(SunmmioMlirContext &ctx);
 
   mlir::Location Loc() const;
+  mlir::Location MakeDebugLoc(const std::string &tag) const;
   mlir::Type MapElementType(DataType dtype) const;
   mlir::Type MapType(const SunMMIOType &type) const;
   mlir::Value EnsureI1(mlir::Value v);
