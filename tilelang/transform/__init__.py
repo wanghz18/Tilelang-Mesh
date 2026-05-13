@@ -70,6 +70,17 @@ def InferSramScope():
     return _ffi_api.InferSramScope()  # type: ignore
 
 
+def LegalizeSunmmioDataPath():
+    """Stage unsupported Sunmmio global->asram data-transfer paths through rsram.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LegalizeSunmmioDataPath()  # type: ignore
+
+
 def LowerTileOp():
     """LowerTileOp
 
@@ -338,6 +349,17 @@ def LowerTilesLoop():
     return _ffi_api.LowerTilesLoop()  # type: ignore
 
 
+def SunmmioTileLoopFusion():
+    """SunmmioTileLoopFusion
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioTileLoopFusion()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
@@ -577,6 +599,20 @@ def LowerSharedTmem():
     return _ffi_api.LowerSharedTmem()  # type: ignore
 
 
+def SunmmioLayoutInference():
+    """SunmmioLayoutInference
+
+    Standalone layout inference pass for the Sunmmio target.
+    Assigns CuteLayout to every buffer and validates layout consistency.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioLayoutInference()  # type: ignore
+
+
 def LayoutReducer():
     """
     Return a TVM transform pass that performs layout reduction/normalization.
@@ -630,7 +666,7 @@ def LowerLDGSTG():
 
 
 def SunmmioPipelinePlanning(debug: bool = False):
-    """InjectSunmmioPipeline
+    """SunmmioPipelinePlanning
 
     Returns
     -------
@@ -649,3 +685,19 @@ def InjectSunmmioPipeline():
         The result pass
     """
     return _ffi_api.InjectSunmmioPipeline()  # type: ignore
+
+def MergeSharedMemoryAllocationsSunmmio(
+    enable_aggressive_merge: bool = False,
+    asram_align_bytes: int = 2048,
+    wsram_align_bytes: int = 2048,
+    rsram_align_bytes: int = 64,
+):
+    """MergeSharedMemoryAllocationsSunmmio
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+
+    return _ffi_api.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge, asram_align_bytes, wsram_align_bytes, rsram_align_bytes)  # type: ignore

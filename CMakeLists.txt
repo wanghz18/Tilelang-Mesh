@@ -21,6 +21,12 @@ option(
   ON
 )
 
+option(
+  TILELANG_BUILD_CPP_TESTS
+  "Build repo-local C++ unit tests under testing/cpp."
+  OFF
+)
+
 if(
   TILELANG_UPDATE_SUBMODULES
   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules"
@@ -147,6 +153,91 @@ unset(_TILELANG_USE_CUDA_STUBS_DEFAULT)
 
 include(cmake/load_tvm.cmake)
 
+# --- NPU-IR Integration ---
+option(USE_NPUIR "Use NPU-IR for Sunmmio backend" ON)
+if(USE_NPUIR)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/CMakeLists.txt")
+    message(STATUS "NPU-IR integration enabled.")
+
+    set(
+      TILELANG_NPUIR_BINARY_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR"
+      CACHE PATH "Binary directory for the embedded NPU-IR build"
+    )
+
+    # In-place fix for NPU-IR's LLVM/MLIR build issues
+    # 1. Provide LLVM/MLIR tablegen binaries
+    set(LLVM_TABLEGEN_EXE llvm-tblgen CACHE FILEPATH "Path to llvm-tblgen")
+    set(MLIR_TABLEGEN_EXE mlir-tblgen CACHE FILEPATH "Path to mlir-tblgen")
+
+    # 2. Preemptively set include directories to avoid find_package(MLIR) failure
+    set(LLVM_PROJECT_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project")
+    set(LLVM_PROJECT_BUILD_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project-build")
+    if(EXISTS "${LLVM_PROJECT_DIR}/llvm/CMakeLists.txt")
+      set(
+        NPUIR_USE_LLVM_SOURCE_DIR
+        "${LLVM_PROJECT_DIR}"
+        CACHE PATH "Path to a cached llvm-project checkout for the embedded NPU-IR build"
+        FORCE
+      )
+      message(STATUS "Using cached NPU-IR LLVM sources from ${NPUIR_USE_LLVM_SOURCE_DIR}")
+    else()
+      unset(NPUIR_USE_LLVM_SOURCE_DIR CACHE)
+      message(STATUS "No cached NPU-IR LLVM sources found at ${LLVM_PROJECT_DIR}; NPU-IR will manage the checkout")
+    endif()
+    set(MLIR_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/mlir/include"
+      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+      CACHE PATH "MLIR include directories" FORCE
+    )
+    set(LLVM_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/llvm/include"
+      "${LLVM_PROJECT_BUILD_DIR}/include"
+      CACHE PATH "LLVM include directories" FORCE
+    )
+
+    # 3. Ensure CMake modules are found during NPU-IR configuration
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/llvm/cmake/modules")
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/mlir/cmake/modules")
+
+    # 4. Mock find_package to bypass NPU-IR's MLIR/LLVM checks
+    # This macro will intercept find_package calls for MLIR and LLVM
+    macro(find_package)
+      set(_find_args "${ARGN}")
+      list(GET _find_args 0 _pkg_name)
+      if(_pkg_name STREQUAL "MLIR" OR _pkg_name STREQUAL "LLVM")
+        set(${_pkg_name}_FOUND ON PARENT_SCOPE)
+        set(${_pkg_name}_FOUND ON) # Also set in current scope for immediate use
+        message(STATUS "Mocking find_package(${_pkg_name}) to bypass NPU-IR check")
+      else()
+        _find_package(${ARGN})
+      endif()
+    endmacro()
+
+    # Pre-set the variables NPU-IR expects from find_package
+    set(MLIR_FOUND ON CACHE INTERNAL "")
+    set(LLVM_FOUND ON CACHE INTERNAL "")
+    set(MLIR_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/mlir/include"
+      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+      CACHE PATH "" FORCE
+    )
+    set(LLVM_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/llvm/include"
+      "${LLVM_PROJECT_BUILD_DIR}/include"
+      CACHE PATH "" FORCE
+    )
+
+    add_subdirectory(3rdparty/NPU-IR "${TILELANG_NPUIR_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
+    # Generated headers (e.g., from TableGen) will be in the binary directory
+    list(APPEND TILE_LANG_INCLUDES ${TILELANG_NPUIR_BINARY_DIR}/include)
+  else()
+    message(WARNING "NPU-IR enabled but 3rdparty/NPU-IR/CMakeLists.txt not found.")
+  endif()
+endif()
+
+
 if(EXISTS ${TVM_SOURCE}/cmake/config.cmake)
   include(${TVM_SOURCE}/cmake/config.cmake)
 else()
@@ -167,9 +258,11 @@ set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 # Collect source files
 file(GLOB TILE_LANG_SRCS
   src/*.cc
+  src/analysis/*.cc
   src/layout/*.cc
   src/tileview/*.cc
   src/transform/*.cc
+  src/transform/sunmmio_tile_loop_fusion/*.cc
   src/transform/common/*.cc
   src/op/*.cc
   src/target/utils.cc
@@ -339,10 +432,12 @@ elseif(USE_CUDA)
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
+    src/target/codegen_sunmmio.cc
     src/target/codegen_py.cc
     src/target/codegen_utils.cc
     src/target/codegen_cutedsl.cc
     src/target/rt_mod_cuda.cc
+    src/target/rt_mod_sunmmio.cc
     src/target/rt_mod_cutedsl.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
@@ -354,12 +449,22 @@ set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
 set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
 
 if(USE_Z3 AND USE_PYPI_Z3)
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
+  # Insert at the beginning to ensure pypi-z3's FindZ3.cmake is used over LLVM's
+  list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
   find_package(Z3 REQUIRED)
 endif()
 
 # Include tvm after configs have been populated
+# TileLang owns the repo-local C++ test surface under testing/cpp. Disable
+# vendored TVM GTest discovery here so `ctest` does not pick up the excluded
+# upstream `cpptest` target as a stale *_NOT_BUILT placeholder.
+if(TILELANG_BUILD_CPP_TESTS)
+  set(USE_GTEST OFF CACHE STRING "Disable vendored TVM GTest integration in TileLang builds" FORCE)
+endif()
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+if(TILELANG_BUILD_CPP_TESTS)
+  set_property(DIRECTORY "${TVM_SOURCE}" PROPERTY TEST_INCLUDE_FILES "")
+endif()
 
 # Resolve compile warnings in tvm
 add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
@@ -410,6 +515,11 @@ set_target_properties(tilelang_cython_wrapper PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
+
+# Source-tree Python imports expect the wrapper to live in build/lib alongside
+# the shared libraries. Make it part of explicit `tilelang` builds so pytest can
+# run from a fresh build tree without extra manual steps.
+add_dependencies(tilelang tilelang_cython_wrapper)
 
 # Install the extension into tilelang/lib inside the wheel
 install(TARGETS tilelang_cython_wrapper
@@ -503,3 +613,9 @@ install(
   RUNTIME DESTINATION tilelang/lib
   ARCHIVE DESTINATION tilelang/lib
 )
+
+if(TILELANG_BUILD_CPP_TESTS)
+  include(CTest)
+  enable_testing()
+  add_subdirectory(testing/cpp)
+endif()
