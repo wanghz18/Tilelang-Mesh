@@ -10,6 +10,7 @@
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
 #include "common/sunmmio_pipeline_utils.h"
+#include "tir/transforms/ir_utils.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
 #include "tvm/node/structural_equal.h"
@@ -625,6 +626,7 @@ tvm::transform::Pass InjectSunmmioPipeline() {
     auto *fptr = f.CopyOnWrite();
     fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(f);
     fptr->body = SunmmioPipelineInjector::Inject(f);
+    fptr->body = ConvertSSA(std::move(fptr->body));
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioPipeline", {});

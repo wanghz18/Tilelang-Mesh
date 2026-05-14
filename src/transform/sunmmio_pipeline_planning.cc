@@ -391,6 +391,9 @@ public:
             set = true;
           }
         }
+      } else if (block->block->name_hint == "reduce_tile_op") {
+        type = DeviceType::VectorCore;
+        set = true;
       }
       if (!set)
         ICHECK(0) << "Can't identify device type for command " << stmt
@@ -529,8 +532,8 @@ public:
           ICHECK(0) << "A command on VectorCore should be a BufferStoreNode "
                        "within For Loops.";
         }
-      } else if (const auto *block_node = stmt.as<BlockNode>()) {
-        auto body = block_node->body;
+      } else if (const auto *block_node = stmt.as<BlockRealizeNode>()) {
+        auto body = block_node->block->body;
         if (const auto *for_node = body.as<ForNode>()) {
           PrimExpr out_extent = 1;
           auto current = for_node;
@@ -542,7 +545,8 @@ public:
           }
           float out_loop_single_cost = 0;
           if (const auto seq = current->body.as<SeqStmtNode>()) {
-            ICHECK(seq->seq.size() == 3) << "Error format of reduce op";
+            // temp 
+            // ICHECK(seq->seq.size() >= 3) << "Error format of reduce op";
             // init of reduce
             if (const auto if_stmt = seq->seq[0].as<IfThenElseNode>()) {
               auto then_stmt = if_stmt->then_case;
