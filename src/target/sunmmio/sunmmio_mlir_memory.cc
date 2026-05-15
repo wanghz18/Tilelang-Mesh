@@ -23,7 +23,6 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
     LOG(FATAL) << "SunMMIO SUVM alloc does not support dynamic extents yet";
   }
 
-  // Reuse SunmmioMlirType::MapType for shape/layout/memory-space mapping.
   SunMMIOType updated_type = memref_type;
   if (updated_type.memory_scope.empty()) {
     updated_type.memory_scope = scope_name;
