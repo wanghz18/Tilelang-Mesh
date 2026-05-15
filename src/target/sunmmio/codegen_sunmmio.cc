@@ -1,9 +1,9 @@
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_builder.h"
 
-#include "../../op/utils.h"
 #include "../../layout/layout.h"
 #include "../../op/region.h"
+#include "../../op/utils.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
@@ -899,7 +899,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
         const BufferBinding &src = LookupBuffer(match->source->buffer);
         RegisterBuffer(match->buffer, false, src.handle);
       } else {
-        RegisterBuffer(match->buffer, false);
+        RegisterBuffer(match->buffer, false, NewValueName());
       }
     }
   }
