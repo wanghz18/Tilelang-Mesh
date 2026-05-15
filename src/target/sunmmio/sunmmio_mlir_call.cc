@@ -26,39 +26,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
-  // ICHECK(source) << "Missing MLIR source buffer for tl.tileop.region `"
-  //                << buffer_handle << "`";
-  if (!source) {
-    // TEMP(sunmmio-fake-region-buffer): Keep the original hard failure
-    // commented so this temporary fake source path can be reverted once the
-    // upstream buffer issue is fixed.
-    // ICHECK(source) << "Missing MLIR source buffer for tl.tileop.region `"
-    //                << buffer_handle << "`";
-    SunMMIOType fake_buffer_type;
-    fake_buffer_type.kind = SunMMIOType::Kind::kMemTensor;
-    fake_buffer_type.dtype = DataType::Float(16);
-    fake_buffer_type.lanes = 1;
-    fake_buffer_type.memory_scope = "global";
-    fake_buffer_type.byte_offset = 0;
-    fake_buffer_type.shape.reserve(extents.size());
-    for (int64_t extent : extents) {
-      fake_buffer_type.shape.push_back(IntImm(DataType::Int(32), extent));
-    }
-    auto fake_memtensor_ty = mlir::dyn_cast<mlir::suvm::MemTensorType>(
-        type.MapType(fake_buffer_type));
-    ICHECK(fake_memtensor_ty)
-        << "tl.tileop.region fake buffer expects a suvm.memtensor source type";
-    auto fake_alloc = mlir::suvm::AllocOp::create(
-        ctx_.builder, type.MakeDebugLoc("fake_region_buffer"),
-        fake_memtensor_ty);
-    fake_alloc->setAttr(
-        "sunmmio.fake",
-        ctx_.builder.getStringAttr("missing_region_buffer:" + buffer_handle));
-    source = fake_alloc.getResult();
-    if (!buffer_handle.empty()) {
-      ctx_.BindMLIRValue(buffer_handle, source);
-    }
-  }
+  ICHECK(source) << "Missing MLIR source buffer for tl.tileop.region `"
+                 << buffer_handle << "`";
 
   auto memtensor_ty =
       mlir::dyn_cast<mlir::suvm::MemTensorType>(source.getType());
@@ -69,22 +38,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
   indices.reserve(mins.size());
   for (const auto &min : mins) {
     mlir::Value index = ctx_.LookupMLIRValue(min.value);
-    // ICHECK(index) << "Missing MLIR min value in tl.tileop.region for `"
-    //               << min.value << "`";
-    if (!index) {
-      // TEMP(sunmmio-fake-region-min): Keep the original hard failure
-      // commented so this temporary fake path can be removed once legacy
-      // thread-axis vars such as %bz are fully eliminated upstream.
-      auto fake_index = mlir::arith::ConstantIntOp::create(
-          ctx_.builder, type.MakeDebugLoc("fake_region_min"), 0, 32);
-      fake_index->setAttr(
-          "sunmmio.fake",
-          ctx_.builder.getStringAttr("missing_region_min:" + min.value));
-      index = fake_index.getResult();
-      if (!min.value.empty()) {
-        ctx_.BindMLIRValue(min.value, index);
-      }
-    }
+    ICHECK(index) << "Missing MLIR min value in tl.tileop.region for `"
+                  << min.value << "`";
     indices.push_back(type.EnsureIndex(index));
   }
 
@@ -117,9 +72,7 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
   auto view_op = mlir::suvm::GetPartitionedTileViewOp::create(
       ctx_.builder, type.MakeDebugLoc("region"), tile_view_ty, source, indices,
       tiled_dims_attr);
-  if (!result_name.empty() && view_op && view_op->getNumResults() == 1) {
-    ctx_.BindMLIRValue(result_name, view_op->getResult(0));
-  }
+  ctx_.BindMLIRValue(result_name, view_op->getResult(0));
   return SunMMIOValue{ret_dtype, result_name, ret_type};
 }
 

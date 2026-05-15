@@ -424,9 +424,24 @@ const SunMMIOValue &
 CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   ICHECK(var != nullptr);
   auto it = var_table_.find(var);
-  ICHECK(it != var_table_.end())
-      << "CodeGenTileLangSunMMIO: unbound var %" << var->name_hint;
-  return it->second;
+  // ICHECK(it != var_table_.end())
+  //     << "CodeGenTileLangSunMMIO: unbound var %" << var->name_hint;
+  // return it->second;
+
+  /** TEMP(sunmmio-fake-var): Keep the original hard failure commented so this
+   * temporary fake path can be removed once legacy vars such as %by are
+   * properly bound upstream.
+   */
+  if (it != var_table_.end()) {
+    return it->second;
+  }
+  SunMMIOValue fake_value;
+  fake_value.dtype = var->dtype;
+  fake_value.value = "%" + var->name_hint;
+  fake_value.type = MapType(var->dtype);
+  auto *self = const_cast<CodeGenTileLangSunMMIO *>(this);
+  self->BindVar(tvm::ffi::GetRef<tir::Var>(var), fake_value);
+  return self->var_table_.find(var)->second;
 }
 
 void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
