@@ -9,11 +9,13 @@
 #include <tvm/ir/type.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -211,6 +213,29 @@ void CodeGenTileLangSunMMIO::MarkVisitedCallOpFromExpr(
   } else {
     visited_call_ops_.insert("unknown_call_target");
   }
+}
+
+bool CodeGenTileLangSunMMIO::TryConsumeSyncTokenId(
+    const tvm::PrimExpr &expr, std::vector<std::string> *string_args) {
+  const auto *call = expr.as<tir::CallNode>();
+  if (!call) {
+    return false;
+  }
+  const auto *op_node = call->op.as<OpNode>();
+  if (!op_node || op_node->name != "tl.sync_token_id") {
+    return false;
+  }
+
+  MarkVisitedNodeType(call->GetTypeKey());
+  MarkVisitedCallOpFromExpr(expr);
+  ICHECK_EQ(call->args.size(), 1)
+      << "tl.sync_token_id expects exactly one argument";
+  const auto *imm = call->args[0].as<IntImmNode>();
+  ICHECK(imm) << "tl.sync_token_id expects an IntImm token id";
+  MarkVisitedNodeType(imm->GetTypeKey());
+  string_args->push_back("token_id=" +
+                         std::to_string(static_cast<int64_t>(imm->value)));
+  return true;
 }
 
 void CodeGenTileLangSunMMIO::CollectExpectedCoverage(const tir::PrimFunc &f) {
@@ -654,6 +679,23 @@ struct TokenAnalyzer {
     return summary;
   }
 
+  TokenSummary AnalyzeWhile(const tir::WhileNode *while_op) {
+    IterState st;
+    AnalyzeStmt(while_op->body, st);
+
+    std::vector<int64_t> live_out_order;
+    live_out_order.reserve(st.produced_order.size());
+    for (int64_t t : st.produced_order) {
+      if (t >= 0 && st.avail_tokens.count(t) != 0) {
+        live_out_order.push_back(t);
+      }
+    }
+
+    TokenSummary summary;
+    summary.live_out = std::move(live_out_order);
+    return summary;
+  }
+
   TokenSummary AnalyzeIf(const tir::IfThenElseNode *if_op) {
     IterState then_st;
     AnalyzeStmt(if_op->then_case, then_st);
@@ -694,6 +736,15 @@ struct TokenAnalyzer {
 
     if (const auto *inner_for = stmt.as<ForNode>()) {
       TokenSummary inner = AnalyzeFor(inner_for);
+      for (int64_t t : inner.live_out) {
+        st.MarkProduced(t);
+      }
+
+      return;
+    }
+
+    if (const auto *inner_while = stmt.as<WhileNode>()) {
+      TokenSummary inner = AnalyzeWhile(inner_while);
       for (int64_t t : inner.live_out) {
         st.MarkProduced(t);
       }
@@ -846,6 +897,21 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
   EmitFor(op);
 }
 
+void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
+  TokenAnalyzer analyzer;
+  TokenSummary summary = analyzer.AnalyzeWhile(op);
+  builder_->BeginWhile(summary.live_out);
+  SunMMIOValue cond = EnsureType(
+      EvalExpr(op->condition),
+      SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
+      DataType::Bool());
+  builder_->BeginWhileBody(cond);
+  EnterScope();
+  VisitStmtTracked(op->body);
+  ExitScope();
+  builder_->EndWhile();
+}
+
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
   SunMMIOValue value = EvalExpr(op->value);
   EnterScope();
@@ -878,9 +944,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::IfThenElseNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode *op) {
-  (void)op;
-  UnsupportedStmt(
-      op, "WhileNode is not supported by SunMMIO direct MLIR lowering.");
+  EmitWhile(op);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
@@ -943,6 +1007,17 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode *op) {
+  if (const auto *call = op->value.as<tir::CallNode>()) {
+    if (call->op.same_as(tir::builtin::ret())) {
+      MarkVisitedCallOpFromExpr(op->value);
+      ICHECK_EQ(call->args.size(), 1) << "tir.ret expects one argument";
+      const auto *imm = call->args[0].as<tir::IntImmNode>();
+      ICHECK(imm && imm->value == 0)
+          << "SunMMIO device kernel only supports T.ret(0)";
+      MarkVisitedNodeType("tir.IntImm");
+      return;
+    }
+  }
   (void)EvalExpr(op->value);
 }
 
@@ -1445,6 +1520,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   std::vector<SunMMIOValue> operands;
   std::vector<std::string> string_args;
   if (callee == "tl.tileop.region") {
+    if (!op->args.empty()) {
+      if (const auto *load = op->args[0].as<tir::BufferLoadNode>()) {
+        MarkVisitedNodeType(load->GetTypeKey());
+      }
+    }
     BufferRegion region =
         tl::NormalizeToBufferRegion(tvm::ffi::GetRef<PrimExpr>(op));
     const BufferBinding &binding = LookupBuffer(region->buffer);
@@ -1456,6 +1536,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       mins.push_back(EvalExpr(range->min));
       const auto *extent_imm = range->extent.as<IntImmNode>();
       ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
+      MarkVisitedNodeType(range->extent->GetTypeKey());
       extents.push_back(static_cast<int64_t>(extent_imm->value));
     }
     SunMMIOType ret_ty = MapType(op->dtype);
@@ -1501,19 +1582,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(2);
 
-    const auto *token_call = op->args[3].as<CallNode>();
-    ICHECK(token_call)
-        << "tl.dma_copy expects third argument to be tl.sync_token_id";
-    const auto *token_op = token_call->op.as<OpNode>();
-    ICHECK(token_op && token_op->name == "tl.sync_token_id")
-        << "tl.dma_copy expects third argument to be tl.sync_token_id";
-    ICHECK_EQ(token_call->args.size(), 1)
-        << "tl.sync_token_id expects exactly one argument";
-    const auto *imm = token_call->args[0].as<IntImmNode>();
-    ICHECK(imm) << "tl.sync_token_id expects an IntImm token id";
-    MarkVisitedNodeType("tir.IntImm");
-    string_args.push_back("token_id=" +
-                          std::to_string(static_cast<int64_t>(imm->value)));
+    ICHECK(TryConsumeSyncTokenId(op->args[3], &string_args))
+        << "tl.dma_copy expects fourth argument to be tl.sync_token_id";
 
     if (src_tiled_dims != 2 || dst_tiled_dims != 2) {
       LOG(WARNING)
@@ -1556,34 +1626,13 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         std::string("clear_accum=") +
         (parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum") ? "1" : "0"));
 
-    const auto *token_call = op->args[7].as<CallNode>();
-    ICHECK(token_call)
+    ICHECK(TryConsumeSyncTokenId(op->args[7], &string_args))
         << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
-    const auto *token_op = token_call->op.as<OpNode>();
-    ICHECK(token_op && token_op->name == "tl.sync_token_id")
-        << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
-    ICHECK_EQ(token_call->args.size(), 1)
-        << "tl.sync_token_id expects exactly one argument";
-    const auto *imm = token_call->args[0].as<IntImmNode>();
-    ICHECK(imm) << "tl.sync_token_id expects an IntImm token id";
-    MarkVisitedNodeType("tir.IntImm");
-    string_args.push_back("token_id=" +
-                          std::to_string(static_cast<int64_t>(imm->value)));
   } else {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
-      if (const auto *call = arg.as<CallNode>()) {
-        if (const auto *op_node = call->op.as<OpNode>()) {
-          if (op_node->name == "tl.sync_token_id" && call->args.size() == 1) {
-            if (const auto *imm = call->args[0].as<IntImmNode>()) {
-              MarkVisitedNodeType("tir.IntImm");
-              string_args.push_back(
-                  "token_id=" +
-                  std::to_string(static_cast<int64_t>(imm->value)));
-              continue;
-            }
-          }
-        }
+      if (TryConsumeSyncTokenId(arg, &string_args)) {
+        continue;
       }
       if (const auto *s = arg.as<StringImmNode>()) {
         MarkVisitedNodeType("tir.StringImm");
