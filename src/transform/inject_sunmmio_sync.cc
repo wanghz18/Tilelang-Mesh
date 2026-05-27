@@ -32,6 +32,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <cstdint>
 #include <set>
 #include <utility>
 
@@ -51,6 +52,69 @@ using namespace tir;
 using namespace tir::transform;
 using arith::IRMutatorWithAnalyzer;
 using arith::IRVisitorWithAnalyzer;
+
+bool IsSyncTokenExpr(const PrimExpr &expr) {
+  const auto *call = expr.as<CallNode>();
+  if (!call) {
+    return false;
+  }
+  return call->op.same_as(sync_token_id());
+}
+
+PrimExpr I64Imm(int64_t value) { return IntImm(DataType::Int(64), value); }
+
+PrimExpr AsI64(PrimExpr value) {
+  if (const auto *imm = value.as<IntImmNode>()) {
+    return I64Imm(imm->value);
+  }
+  if (value.dtype() == DataType::Int(64)) {
+    return value;
+  }
+  return Cast(DataType::Int(64), value);
+}
+
+PrimExpr CoreBitMask(PrimExpr core_id) {
+  if (const auto *imm = core_id.as<IntImmNode>()) {
+    ICHECK_GE(imm->value, 0);
+    ICHECK_LT(imm->value, 64)
+        << "barrier mask currently supports core ids in [0, 64)";
+    return I64Imm(static_cast<int64_t>(uint64_t{1} << imm->value));
+  }
+  return I64Imm(1) << AsI64(core_id);
+}
+
+PrimExpr FullCoreMask(int total_cores) {
+  ICHECK_GE(total_cores, 0);
+  ICHECK_LE(total_cores, 64)
+      << "barrier mask currently supports at most 64 cores";
+  uint64_t mask =
+      total_cores == 64 ? ~uint64_t{0} : ((uint64_t{1} << total_cores) - 1);
+  return I64Imm(static_cast<int64_t>(mask));
+}
+
+bool BroadcastCallHasSrcCore(const CallNode *call) {
+  ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgCount))
+      << "broadcast_() call is missing its fixed argument prefix.";
+  size_t non_token_args = call->args.size();
+  if (non_token_args > 0 && IsSyncTokenExpr(call->args.back())) {
+    --non_token_args;
+  }
+  ICHECK(non_token_args == static_cast<size_t>(kBroadcastArgCount) ||
+         non_token_args == static_cast<size_t>(kBroadcastArgCount + 1))
+      << "broadcast_() expects fixed args plus optional src_core, got "
+      << non_token_args << " non-token args.";
+  return non_token_args == static_cast<size_t>(kBroadcastArgCount + 1);
+}
+
+PrimExpr GetBroadcastSrcCore(const CallNode *call) {
+  ICHECK(BroadcastCallHasSrcCore(call))
+      << "broadcast_() call does not carry optional src_core.";
+  size_t non_token_args = call->args.size();
+  if (IsSyncTokenExpr(call->args.back())) {
+    --non_token_args;
+  }
+  return call->args[non_token_args - 1];
+}
 
 // Helper function to check if two memory regions intersect.
 // Used for dependency analysis to determine if synchronization is needed.
@@ -375,17 +439,11 @@ private:
   // Helper to construct and inject a barrier_init call.
   // Also establishes the mappings between the generated token and barrier IDs.
   void init_barrier_(Array<Stmt> &stmts, int barrier_id, int token_id,
-                     PrimExpr read_core, Array<PrimExpr> write_cores = {}) {
+                     PrimExpr read_mask, PrimExpr write_mask) {
     Array<PrimExpr> args;
-    args.push_back(barrier_id);
-    args.push_back(read_core);
-    if (!write_cores.empty()) {
-      for (const auto &core : write_cores) {
-        if (!analyzer_->CanProve(core == read_core)) {
-          args.push_back(core);
-        }
-      }
-    }
+    args.push_back(IntImm(DataType::Int(32), barrier_id));
+    args.push_back(AsI64(read_mask));
+    args.push_back(AsI64(write_mask));
 
     stmts.push_back(Evaluate(Call(DataType::Handle(), barrier_init(), args)));
 
@@ -394,63 +452,27 @@ private:
   }
 
   // Analyzes a broadcast operation and initializes a barrier for it.
-  // Calculates the read core and write cores based on the mesh topology
-  // (rows/cols) and the broadcast direction (horizontal or vertical),
-  // considering given masks.
+  // tl.broadcast_ uses args = [src_region, dst_region, direction, mask,
+  // src_offset_byte, optional src_core, optional sync_token_id]. The optional
+  // src_core is immediately before sync_token_id when the token is present.
+  // The mask is an i64 bitmask of receiving cores.
   void process_broadcast_barrier(const CallNode *call, int curr_token_id,
                                  int curr_barrier_id, Array<Stmt> &stmts) {
-    ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgMaskBegin))
+    ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgCount))
         << "broadcast_() call is missing its fixed argument prefix.";
-    PrimExpr src_core = call->args[kBroadcastArgSrcCore];
-    int direction =
-        call->args[kBroadcastArgDirection].as<IntImm>().value()->value;
-    // Trailing core-mask indices start at kBroadcastArgMaskBegin — past the
-    // src_offset_byte slot at kBroadcastArgSrcOffsetByte.
-    Array<int> masks;
-    for (size_t i = kBroadcastArgMaskBegin; i < call->args.size(); i++) {
-      masks.push_back(call->args[i].as<IntImm>().value()->value);
+    int total_cores = mesh_nrow_ * mesh_ncol_;
+    ICHECK_LE(total_cores, 64)
+        << "tl.broadcast_ barrier mask currently supports at most 64 cores";
+    if (!BroadcastCallHasSrcCore(call)) {
+      PrimExpr all_mask = FullCoreMask(total_cores);
+      init_barrier_(stmts, curr_barrier_id, curr_token_id, all_mask, all_mask);
+      return;
     }
 
-    PrimExpr src_core_row =
-        analyzer_->Simplify(tvm::floordiv(src_core, mesh_ncol_));
-    PrimExpr src_core_col =
-        analyzer_->Simplify(tvm::floormod(src_core, mesh_ncol_));
-    auto read_cores = Array<PrimExpr>{src_core};
-    Array<PrimExpr> write_cores;
-    bool mask_flag = false;
-    if (direction == 0) { // horizontal
-      for (int j = 0; j < mesh_ncol_; j++) {
-        for (const auto &mask : masks) {
-          if (mask == j) {
-            mask_flag = true;
-            break;
-          }
-        }
-        if (mask_flag) {
-          mask_flag = false;
-          continue;
-        }
-        write_cores.push_back(
-            analyzer_->Simplify(src_core_row * mesh_ncol_ + j));
-      }
-    } else if (direction == 1) { // vertical
-      for (int i = 0; i < mesh_nrow_; i++) {
-        for (const auto &mask : masks) {
-          if (mask == i) {
-            mask_flag = true;
-            break;
-          }
-        }
-        if (mask_flag) {
-          mask_flag = false;
-          continue;
-        }
-        write_cores.push_back(
-            analyzer_->Simplify(i * mesh_ncol_ + src_core_col));
-      }
-    }
-
-    init_barrier_(stmts, curr_barrier_id, curr_token_id, src_core, write_cores);
+    PrimExpr src_core = GetBroadcastSrcCore(call);
+    PrimExpr read_mask = CoreBitMask(src_core);
+    PrimExpr write_mask = call->args[kBroadcastArgMask];
+    init_barrier_(stmts, curr_barrier_id, curr_token_id, read_mask, write_mask);
   }
 
   // Extracts all buffer read and write accesses from a primitive expression
