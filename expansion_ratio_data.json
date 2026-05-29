@@ -1,0 +1,22 @@
+{
+    "GEMM": {
+        "dsl_loc": 10,
+        "tir_loc": 86
+    },
+    "FlashAttention": {
+        "dsl_loc": 49,
+        "tir_loc": 524
+    },
+    "Flash Decoding": {
+        "dsl_loc": 56,
+        "tir_loc": 650
+    },
+    "Flash MLA Decode": {
+        "dsl_loc": 46,
+        "tir_loc": 566
+    },
+    "Native Sparse Attention": {
+        "dsl_loc": 57,
+        "tir_loc": 487
+    }
+}
