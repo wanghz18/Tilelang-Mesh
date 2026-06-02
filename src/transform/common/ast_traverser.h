@@ -264,9 +264,9 @@ public:
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-      // } else if (call->op.same_as(broadcast_())) {
-      //   read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      //   write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
+      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {
