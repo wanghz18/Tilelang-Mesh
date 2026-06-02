@@ -446,7 +446,7 @@ private:
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
 
     if (!iterations_anno || !used_buffers_anno || !versioned_buffers_anno ||
-        !prologue_orders_anno || !body_orders_anno || !epilogue_orders_anno) {
+        !prologue_orders_anno || !body_orders_anno) {
       return for_node;
     }
 
@@ -543,8 +543,10 @@ private:
         Downcast<Array<String>>(prologue_orders_anno.value());
     Array<String> body_orders =
         Downcast<Array<String>>(body_orders_anno.value());
-    Array<String> epilogue_orders =
-        Downcast<Array<String>>(epilogue_orders_anno.value());
+    Array<String> epilogue_orders;
+    if (epilogue_orders_anno) {
+      epilogue_orders = Downcast<Array<String>>(epilogue_orders_anno.value());
+    }
     Array<Buffer> versioned_buffers =
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
@@ -590,8 +592,6 @@ private:
     if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {
       epilogue_iterations = mod_int->value;
     }
-    ICHECK(epilogue_iterations != -1)
-        << "Can't calculate the epilogue iterations.";
 
     if (epilogue_iterations == 0) {
       extent = extent - 1;
@@ -602,15 +602,35 @@ private:
     for_body.push_back(new_for_stmt);
 
     // Step 3.3: Rewrite the epilogue.
-    for (const auto &order_str : epilogue_orders) {
-      int iter = name2iter(order_str);
-      int id = name2id(order_str);
-      Stmt stmt = pipeline_body_seq->seq[id];
-      rewriter.set_current_version(iter);
-      PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
-      rewriter.set_loop_var_replacement(replaced_loop_var);
-      stmt = rewriter(stmt);
-      for_body.push_back(stmt);
+    if (epilogue_iterations != -1) {
+      for (const auto &order_str : epilogue_orders) {
+        int iter = name2iter(order_str);
+        int id = name2id(order_str);
+        Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_version(iter);
+        PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
+        rewriter.set_loop_var_replacement(replaced_loop_var);
+        stmt = rewriter(stmt);
+        for_body.push_back(stmt);
+      }
+    } else {
+      // Dynamic epilogue loop for non-constant iterations
+      Var epilogue_loop_var("epilogue_i", for_node->loop_var->dtype);
+      Array<Stmt> epilogue_body;
+      for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
+        Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_version(
+            0); // Versioning is not deeply supported in dynamic epilogue yet
+        PrimExpr replaced_loop_var =
+            extent * iterations + epilogue_loop_var + for_node->min;
+        rewriter.set_loop_var_replacement(replaced_loop_var);
+        stmt = rewriter(stmt);
+        epilogue_body.push_back(stmt);
+      }
+      For dynamic_epilogue_for = For(
+          epilogue_loop_var, PrimExpr(0), epilogue_iterations_expr,
+          ForKind::kSerial, SeqStmt::Flatten(epilogue_body), std::nullopt, {});
+      for_body.push_back(dynamic_epilogue_for);
     }
     return SeqStmt::Flatten(for_body);
   }

@@ -36,11 +36,15 @@ using namespace tir;
 
 int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-bool PipelineRegionIntersect(const Region &region1, const Region &region2) {
-  ICHECK(region1.size() == region2.size());
-  for (size_t i = 0; i < region1.size(); i++) {
-    Range dim1 = region1[i];
-    Range dim2 = region2[i];
+bool PipelineRegionIntersect(const BufferRegion &region1,
+                             const BufferRegion &region2) {
+  if (region1->buffer == region2->buffer) {
+    return true;
+  }
+  ICHECK(region1->region.size() == region2->region.size());
+  for (size_t i = 0; i < region1->region.size(); i++) {
+    Range dim1 = region1->region[i];
+    Range dim2 = region2->region[i];
     auto int_set1 = arith::IntSet::FromRange(dim1);
     auto int_set2 = arith::IntSet::FromRange(dim2);
     if (arith::Intersect({int_set1, int_set2}).IsNothing()) {
@@ -75,28 +79,96 @@ public:
   Role GetRole(const Stmt &stmt) const { return GetRole(stmt.get()); }
 
   void VisitStmt_(const EvaluateNode *op) final {
+    traverser_.traverse_stmt(ffi::GetRef<Stmt>(op));
+
     Role role = Role::kConsumer;
     if (auto call = op->value.as<CallNode>()) {
       if (call->op.same_as(Op::Get("tl.dma_copy"))) {
         BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
-        if (IsGlobalBuffer(src_region->buffer)) {
+        if (IsGlobalBuffer(src_region->buffer) ||
+            producer_buffers_.count(src_region->buffer.get())) {
+          role = Role::kProducer;
+        }
+      } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+        BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
+        if (IsGlobalBuffer(src_region->buffer) ||
+            producer_buffers_.count(src_region->buffer.get())) {
           role = Role::kProducer;
         }
       }
     }
+
+    if (role == Role::kProducer) {
+      for (auto &it : traverser_.write_buffer_regions_) {
+        if (all_read_buffers_.count(it->buffer.get())) {
+          role = Role::kConsumer;
+          break;
+        }
+      }
+    }
+
+    if (role == Role::kProducer) {
+      for (auto &it : traverser_.write_buffer_regions_) {
+        producer_buffers_.insert(it->buffer.get());
+      }
+    } else {
+      // If it's a Consumer, it might overwrite a producer buffer.
+      // We must invalidate the producer buffer to prevent subsequent reads from
+      // falsely assuming it's from the producer.
+      for (auto &it : traverser_.write_buffer_regions_) {
+        producer_buffers_.erase(it->buffer.get());
+      }
+    }
+
+    // Record reads AFTER determining the role and updating producer_buffers_
+    // This is because a Consumer's read shouldn't retroactively invalidate a
+    // Producer's write in the SAME statement if we were doing in-place analysis
+    // differently, but here we just need to ensure the order of operations
+    // reflects data flow.
+    for (auto &it : traverser_.read_buffer_regions_) {
+      all_read_buffers_.insert(it->buffer.get());
+    }
+
     SetRole(op, role);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
     traverser_.traverse_stmt(ffi::GetRef<Stmt>(op));
+
     Role role = Role::kProducer;
     auto reads = traverser_.read_buffer_regions_;
     for (auto &it : reads) {
-      if (!IsGlobalBuffer(it->buffer)) {
+      if (!IsGlobalBuffer(it->buffer) &&
+          producer_buffers_.count(it->buffer.get()) == 0) {
         role = Role::kConsumer;
         break;
       }
     }
+
+    if (role == Role::kProducer) {
+      for (auto &it : traverser_.write_buffer_regions_) {
+        if (all_read_buffers_.count(it->buffer.get())) {
+          role = Role::kConsumer;
+          break;
+        }
+      }
+    }
+
+    if (role == Role::kProducer) {
+      for (auto &it : traverser_.write_buffer_regions_) {
+        producer_buffers_.insert(it->buffer.get());
+      }
+    } else {
+      // If it's a Consumer, invalidate overwritten producer buffers
+      for (auto &it : traverser_.write_buffer_regions_) {
+        producer_buffers_.erase(it->buffer.get());
+      }
+    }
+
+    for (auto &it : traverser_.read_buffer_regions_) {
+      all_read_buffers_.insert(it->buffer.get());
+    }
+
     SetRole(op, role);
   }
 
@@ -144,6 +216,8 @@ public:
 private:
   void SetRole(const StmtNode *stmt, Role role) { map_[stmt] = role; }
   std::unordered_map<const StmtNode *, Role> map_;
+  std::unordered_set<const BufferNode *> producer_buffers_;
+  std::unordered_set<const BufferNode *> all_read_buffers_;
   ASTTraverser traverser_;
 };
 
@@ -405,6 +479,9 @@ public:
         if (call->op.same_as(Op::Get("tl.dma_copy"))) {
           type = DeviceType::ODMA;
           set = true;
+        } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+          type = DeviceType::ODMA;
+          set = true;
         }
       }
       if (!set)
@@ -465,6 +542,8 @@ public:
             float delay = 50 + num_kb;
             // LOG(INFO) << "copy delay: " << delay;
             return delay;
+          } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+            return 50;
           }
         }
       }
@@ -545,7 +624,7 @@ public:
           }
           float out_loop_single_cost = 0;
           if (const auto seq = current->body.as<SeqStmtNode>()) {
-            // temp 
+            // temp
             // ICHECK(seq->seq.size() >= 3) << "Error format of reduce op";
             // init of reduce
             if (const auto if_stmt = seq->seq[0].as<IfThenElseNode>()) {
@@ -914,7 +993,7 @@ public:
     // Value: List of (Region, Command Index, AccessType)
     enum AccessType { kRead, kWrite };
     struct AccessRecord {
-      Region region;
+      BufferRegion region;
       int cmd_idx;
       AccessType type;
     };
@@ -941,7 +1020,7 @@ public:
             continue;
           }
           if (it->type == kWrite &&
-              PipelineRegionIntersect(read_region->region, it->region)) {
+              PipelineRegionIntersect(read_region, it->region)) {
             // Found a RAW dependency: it->cmd_idx -> curr_idx
             bool exists = false;
             for (int pred : predecessors_[curr_idx]) {
@@ -976,7 +1055,7 @@ public:
               GetVersionId(commands[it->cmd_idx]) != curr_ver) {
             continue;
           }
-          if (PipelineRegionIntersect(write_region->region, it->region)) {
+          if (PipelineRegionIntersect(write_region, it->region)) {
             // Dependency: it->cmd_idx -> curr_idx
             bool exists = false;
             for (int pred : predecessors_[curr_idx]) {
@@ -1009,7 +1088,7 @@ public:
           buffer_access_history[read_region->buffer.get()] = {};
         }
         buffer_access_history[read_region->buffer.get()].push_back(
-            {read_region->region, curr_idx, kRead});
+            {read_region, curr_idx, kRead});
       }
       for (const auto &write_region : curr_cmd.writes) {
         if (buffer_access_history.find(write_region->buffer.get()) ==
@@ -1017,7 +1096,7 @@ public:
           buffer_access_history[write_region->buffer.get()] = {};
         }
         buffer_access_history[write_region->buffer.get()].push_back(
-            {write_region->region, curr_idx, kWrite});
+            {write_region, curr_idx, kWrite});
       }
     }
   }
@@ -1071,9 +1150,9 @@ public:
     sort(primary_queue.begin(), primary_queue.end(), primary_cmp);
     float time = 0;
     std::vector<Command> schedule;
-    if (debug_) {
-      LOG(INFO) << "Scheduling starts.";
-    }
+    // if (debug_) {
+    //   LOG(INFO) << "Scheduling starts.";
+    // }
 
     // Phase 1: schedule only primary commands (prefetch commands do not
     // participate in priority scheduling).
@@ -1256,9 +1335,9 @@ public:
       //   command_info.open("command_info.log", std::ios::out);
       //   float all_time = 0;
       //   for (const auto &cmd : schedule) {
-      //     all_time = std::max(all_time, cmd.scheduled_start +
-      //     cmd.get_delay()); command_info << cmd.name << '\n'; for (auto &read
-      //     : cmd.reads) {
+      //     all_time = std::max(all_time, cmd.scheduled_start + cmd.get_delay());
+      //     command_info << cmd.name << '\n';
+      //     for (auto &read : cmd.reads) {
       //       if (!IsGlobalBuffer(read->buffer))
       //         command_info << read << ';';
       //     }
@@ -1269,7 +1348,7 @@ public:
       //     command_info << '\n';
       //   }
 
-      //   LOG(INFO) << "Total time: " << all_time;
+      //   // LOG(INFO) << "Total time: " << all_time;
       // }
     }
     return schedule;
@@ -1500,9 +1579,9 @@ private:
       }
     }
 
-    if (debug_) {
-      LOG(INFO) << versioned_buffers;
-    }
+    // if (debug_) {
+    //   LOG(INFO) << versioned_buffers;
+    // }
 
     Scheduler body_scheduler;
     int iterations = body_scheduler.num_stages_to_iterations(num_stages);
@@ -1562,40 +1641,40 @@ private:
     if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {
       epilogue_iterations = mod_int->value;
     }
-    ICHECK(epilogue_iterations != -1)
-        << "Can't calculate the epilogue iterations.";
 
-    if (epilogue_iterations == 0) {
-      epilogue_iterations = iterations;
-    }
-    // 1.4.1 Epilogue Loop
-    int epilogue_iter = 0;
-    for (int i = 0; i < epilogue_iterations - 1; i++) {
-      for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
-        auto command =
-            body_scheduler.commands[i * pipeline_body_seq->size() + j];
-        int iter = command.iter;
-        int id = command.id;
-        Command cmd(id, iter, command.stmt);
-        traverser.traverse_stmt(command.stmt);
-        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
-                                     traverser.write_buffer_regions_);
-        epilogue_scheduler.commands.push_back(cmd);
+    if (epilogue_iterations != -1) {
+      if (epilogue_iterations == 0) {
+        epilogue_iterations = iterations;
       }
-      epilogue_iter += 1;
-    }
+      // 1.4.1 Epilogue Loop
+      int epilogue_iter = 0;
+      for (int i = 0; i < epilogue_iterations - 1; i++) {
+        for (size_t j = 0; j < pipeline_body_seq->size(); j++) {
+          auto command =
+              body_scheduler.commands[i * pipeline_body_seq->size() + j];
+          int iter = command.iter;
+          int id = command.id;
+          Command cmd(id, iter, command.stmt);
+          traverser.traverse_stmt(command.stmt);
+          cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                       traverser.write_buffer_regions_);
+          epilogue_scheduler.commands.push_back(cmd);
+        }
+        epilogue_iter += 1;
+      }
 
-    // 1.4.2 The End of Epilogue
-    for (auto &command : iter0_commands) {
-      if (std::find(prologue_orders.begin(), prologue_orders.end(),
-                    command.name) == prologue_orders.end()) {
-        int iter = command.iter;
-        int id = command.id;
-        Command cmd(id, epilogue_iter, command.stmt);
-        traverser.traverse_stmt(command.stmt);
-        cmd.get_command_reads_writes(traverser.read_buffer_regions_,
-                                     traverser.write_buffer_regions_);
-        epilogue_scheduler.commands.push_back(cmd);
+      // 1.4.2 The End of Epilogue
+      for (auto &command : iter0_commands) {
+        if (std::find(prologue_orders.begin(), prologue_orders.end(),
+                      command.name) == prologue_orders.end()) {
+          int iter = command.iter;
+          int id = command.id;
+          Command cmd(id, epilogue_iter, command.stmt);
+          traverser.traverse_stmt(command.stmt);
+          cmd.get_command_reads_writes(traverser.read_buffer_regions_,
+                                       traverser.write_buffer_regions_);
+          epilogue_scheduler.commands.push_back(cmd);
+        }
       }
     }
 
@@ -1614,15 +1693,19 @@ private:
 
     epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
     epilogue_scheduler.debug_ = debug_;
-    epilogue_scheduler.BuildDependencyGraph();
-    epilogue_scheduler.CalculateBottomLevels();
+    if (epilogue_iterations != -1) {
+      epilogue_scheduler.BuildDependencyGraph();
+      epilogue_scheduler.CalculateBottomLevels();
+    }
 
     // 2. Do critical path pipeline
     auto prologue_result =
         prologue_scheduler.CriticalPathPipeline("prologue.log");
     auto body_result = body_scheduler.CriticalPathPipeline("body.log");
-    auto epilogue_result =
-        epilogue_scheduler.CriticalPathPipeline("epilogue.log");
+    std::vector<Command> epilogue_result;
+    if (epilogue_iterations != -1) {
+      epilogue_result = epilogue_scheduler.CriticalPathPipeline("epilogue.log");
+    }
 
     // int prologue_time = 0;
     // for (const auto &cmd : prologue_result) {
@@ -1670,10 +1753,12 @@ private:
     }
     annotations.Set("body_orders", orders);
     orders.clear();
-    for (auto &it : epilogue_result) {
-      orders.push_back(it.name);
+    if (epilogue_iterations != -1) {
+      for (auto &it : epilogue_result) {
+        orders.push_back(it.name);
+      }
+      annotations.Set("epilogue_orders", orders);
     }
-    annotations.Set("epilogue_orders", orders);
 
     Array<Buffer> used_buffers_array(used_buffers.begin(), used_buffers.end());
     annotations.Set("used_buffers", used_buffers_array);
