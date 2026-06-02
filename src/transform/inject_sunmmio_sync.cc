@@ -550,8 +550,8 @@ private:
 };
 
 // Collector for asynchronous operations within a loop body.
-// Identifies DMA copies, MMA operations, and Broadcasts that happen
-// asynchronously.
+// Identifies DMA copies, layout transforms, MMA operations, and Broadcasts that
+// happen asynchronously.
 struct AccessRecord {
   Buffer buffer;
   Region region;
@@ -576,6 +576,12 @@ public:
       rec.call = call;
       rec.order = order_++;
       if (call->op.same_as(dma_copy())) {
+        auto src = NormalizeToBufferRegion(call->args[0]);
+        auto dst = NormalizeToBufferRegion(call->args[1]);
+        rec.reads.push_back({src->buffer, src->region});
+        rec.writes.push_back({dst->buffer, dst->region});
+        async_ops.push_back(rec);
+      } else if (call->op.same_as(sunmmio_layout_transform())) {
         auto src = NormalizeToBufferRegion(call->args[0]);
         auto dst = NormalizeToBufferRegion(call->args[1]);
         rec.reads.push_back({src->buffer, src->region});
@@ -1260,6 +1266,25 @@ private:
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
       if (call->op.same_as(dma_copy())) {
+        Array<Stmt> stmts;
+        int curr_token_id;
+        if (pre_assigned_tokens_.count(op)) {
+          curr_token_id = pre_assigned_tokens_[op];
+        } else {
+          curr_token_id = GetNextTokenId();
+        }
+
+        InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
+        token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
+                                  curr_token_id);
+        token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
+                                   stmts, curr_token_id);
+
+        curr_stmt_with_token_id(call, stmts, curr_token_id);
+
+        return SeqStmt::Flatten(stmts);
+      } else if (call->op.same_as(sunmmio_layout_transform())) {
+        // Same dependency shape as dma_copy: reads args[0], writes args[1].
         Array<Stmt> stmts;
         int curr_token_id;
         if (pre_assigned_tokens_.count(op)) {
