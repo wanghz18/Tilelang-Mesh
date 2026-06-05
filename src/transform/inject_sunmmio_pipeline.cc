@@ -1,3 +1,4 @@
+#include "../layout/cute_layout.h"
 #include "../layout/utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -11,6 +12,7 @@
 #include "common/remap_buffer_rewriter.h"
 #include "common/sunmmio_pipeline_utils.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/ir/attrs.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
 #include "tvm/node/structural_equal.h"
@@ -59,6 +61,8 @@ public:
           substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
     }
 
+    substituter.RewriteFunctionLayoutAttrs(f);
+
     f.CopyOnWrite()->body =
         RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
 
@@ -66,6 +70,32 @@ public:
   }
 
 private:
+  void RewriteFunctionLayoutAttrs(PrimFunc &f) {
+    auto layout_map_opt = f->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap);
+    if (!layout_map_opt) {
+      return;
+    }
+
+    arith::Analyzer analyzer;
+    Map<Buffer, Layout> new_layout_map;
+    for (const auto &[buffer, layout] : layout_map_opt.value()) {
+      auto it = buffer_remap_.find(buffer);
+      if (it == buffer_remap_.end()) {
+        new_layout_map.Set(buffer, layout);
+        continue;
+      }
+
+      const Buffer &new_buffer = (*it).second;
+      Optional<Layout> derived_layout = DeriveLayoutLike(
+          layout, new_buffer->shape, Optional<Array<Integer>>(), &analyzer);
+      ICHECK(derived_layout.defined())
+          << "Failed to derive multiversioned layout for buffer "
+          << buffer->name << " with shape " << new_buffer->shape;
+      new_layout_map.Set(new_buffer, derived_layout.value());
+    }
+    f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
+  }
+
   Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {
     const auto *ptr_type =
         TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
@@ -643,8 +673,9 @@ private:
 tvm::transform::Pass InjectSunmmioPipeline() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    Stmt multiversioned_body = SunmmioMultiVersionBufferRewriter::Substitute(f);
     auto *fptr = f.CopyOnWrite();
-    fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(f);
+    fptr->body = multiversioned_body;
     fptr->body = SunmmioPipelineInjector::Inject(f);
     fptr->body = ConvertSSA(std::move(fptr->body));
     return f;

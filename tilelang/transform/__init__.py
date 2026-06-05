@@ -697,6 +697,17 @@ def SunmmioPipelinePlanning(debug: bool = False):
     return _ffi_api.SunmmioPipelinePlanning(debug)  # type: ignore
 
 
+def SunmmioPipelinePlanningV2(debug: bool = False):
+    """SunmmioPipelinePlanningV2
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioPipelinePlanningV2(debug)  # type: ignore
+
+
 def InjectSunmmioPipeline():
     """InjectSunmmioPipeline
 

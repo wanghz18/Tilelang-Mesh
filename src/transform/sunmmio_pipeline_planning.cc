@@ -1335,9 +1335,9 @@ public:
       //   command_info.open("command_info.log", std::ios::out);
       //   float all_time = 0;
       //   for (const auto &cmd : schedule) {
-      //     all_time = std::max(all_time, cmd.scheduled_start + cmd.get_delay());
-      //     command_info << cmd.name << '\n';
-      //     for (auto &read : cmd.reads) {
+      //     all_time = std::max(all_time, cmd.scheduled_start +
+      //     cmd.get_delay()); command_info << cmd.name << '\n'; for (auto &read
+      //     : cmd.reads) {
       //       if (!IsGlobalBuffer(read->buffer))
       //         command_info << read << ';';
       //     }

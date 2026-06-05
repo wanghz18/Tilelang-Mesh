@@ -7,34 +7,25 @@ from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 
-def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="float16", accum_dtype="float"):
+def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
     @T.prim_func
     def gemm(
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=accum_dtype,
         ),
     ):
@@ -634,15 +625,35 @@ def native_sparse_attention(
 
 
 CASES = [
-    # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=2),
-    # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
-    # matmul(1024, 1024, 1024, 128, 128, 32, num_stages=4),
-    # lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=5),
+    lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
     # lambda: flashattn(num_stages=3),
-    lambda: flashdecoding(num_stages=3),
+    # lambda: flashdecoding(num_stages=3),
     # lambda: flashmladecode(num_stages=5),
     # lambda: native_sparse_attention(num_stages=5),
 ]
+
+
+def lower_and_legalize_sunmmio_pipeline_test(mod, target):
+    mod = tir.transform.BindTarget(target)(mod)
+    if should_force_let_inline():
+        mod = tl.transform.LetInline()(mod)
+    mod = tl.transform.LegalizeNegativeIndex()(mod)
+    mod = tl.transform.InjectAssumes()(mod)
+    mod = tl.transform.Simplify()(mod)
+    mod = tl.transform.InferSramScope()(mod)
+    mod = tl.transform.LegalizeSunmmioDataPath()(mod)
+    mod = tl.transform.SunmmioLayoutInference()(mod)
+    LayoutVisual(mod)
+    mod = tl.transform.LowerTileOp()(mod)
+    mod = tl.transform.LegalizeTilesLoop()(mod)
+    mod = tl.transform.TilesLoop()(mod)
+    mod = tl.transform.LegalizeVectorizedLoop()(mod)
+    mod = tl.transform.LegalizeSafeMemoryAccess()(mod)
+    mod = tl.transform.LowerAccessPtr()(mod)
+    mod = tl.transform.Simplify()(mod)
+    mod = tl.transform.HoistNonRestrictParams()(mod)
+    mod = tl.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    return mod
 
 
 @pytest.mark.parametrize(
@@ -655,7 +666,9 @@ def test_tilelang_transform_sunmmio_pipeline(kernel):
 
     with tvm.target.Target(target):
         mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
-        mod = LowerAndLegalize(mod, target)
-        mod = tl.transform.SunmmioPipelinePlanning(debug=True)(mod)
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        print(mod)
+        mod = tl.transform.SunmmioPipelinePlanningV2(debug=True)(mod)
         mod = tl.transform.InjectSunmmioPipeline()(mod)
         mod.show()
