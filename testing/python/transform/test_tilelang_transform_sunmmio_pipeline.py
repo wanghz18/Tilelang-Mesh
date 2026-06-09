@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from tilelang import tvm as tvm
 import tilelang as tl
@@ -5,6 +7,8 @@ import tilelang.language as T
 from tilelang.engine.phase import *
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
+
+_get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
@@ -49,8 +53,8 @@ def flashattn(batch=1, heads=64, seq_len=4096, dim=128, is_causal=False, groups=
     head_kv = heads // groups
     q_shape = [batch, seq_len, heads, dim]
     kv_shape = [batch, seq_len, head_kv, dim]
-    dtype = T.float16
-    accum_dtype = T.float16
+    dtype = T.bfloat16
+    accum_dtype = T.bfloat16
 
     @T.prim_func
     def main(
@@ -625,11 +629,29 @@ def native_sparse_attention(
 
 
 CASES = [
-    lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
-    # lambda: flashattn(num_stages=3),
-    # lambda: flashdecoding(num_stages=3),
-    # lambda: flashmladecode(num_stages=5),
-    # lambda: native_sparse_attention(num_stages=5),
+    (
+        "matmul",
+        lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
+        {
+            "A_rsram_stage": [3, 128, 32],
+            "A_shared": [3, 128, 32],
+            "B_shared": [3, 32, 128],
+            "C_shared": [128, 128],
+        },
+    ),
+    (
+        "flashattn",
+        lambda: flashattn(num_stages=3),
+        {
+            "K_shared": [3, 64, 128],
+            "acc_s": [3, 64, 64],
+            "acc_s_cast": [3, 64, 64],
+            "V_shared": [3, 64, 128],
+        },
+    ),
+    # ("flashdecoding", lambda: flashdecoding(num_stages=3), {}),
+    # ("flashmladecode", lambda: flashmladecode(num_stages=5), {}),
+    # ("native_sparse_attention", lambda: native_sparse_attention(num_stages=5), {}),
 ]
 
 
@@ -656,19 +678,55 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     return mod
 
 
+def dump_pipeline_test_log(case_name, stage, mod):
+    """Dump the IRModule at a key pipeline stage for offline inspection."""
+    log_dir = Path("pass_logs") / "sunmmio_pipeline_test"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{case_name}_{stage}.tir"
+    log_path.write_text(mod.script(), encoding="utf-8")
+    print(f"[sunmmio_pipeline_test] dumped {stage} to {log_path}")
+
+
+def _shape_to_int_list(shape):
+    """Convert a TIR shape array into a plain Python int list."""
+    return [int(dim) for dim in shape]
+
+
+def assert_multiversioned_func_layouts(func, expected_shapes):
+    """Assert that function-level layout_map matches multiversioned buffer shapes."""
+    assert "layout_map" in func.attrs
+    layout_map = func.attrs["layout_map"]
+
+    layout_shapes = {}
+    buffer_shapes = {}
+    for buffer, layout in layout_map.items():
+        layout_shapes[buffer.name] = _shape_to_int_list(_get_logical_shape(layout))
+        buffer_shapes[buffer.name] = _shape_to_int_list(buffer.shape)
+
+    for buffer_name, expected_shape in expected_shapes.items():
+        expected_shape = list(expected_shape)
+        assert buffer_name in layout_shapes, layout_shapes
+        assert layout_shapes[buffer_name] == expected_shape, layout_shapes
+        assert buffer_shapes[buffer_name] == expected_shape, buffer_shapes
+
+
 @pytest.mark.parametrize(
-    "kernel",
+    "case_name,kernel,expected_layout_shapes",
     CASES,
+    ids=[case_name for case_name, _, _ in CASES],
 )
-def test_tilelang_transform_sunmmio_pipeline(kernel):
+def test_tilelang_transform_sunmmio_pipeline(case_name, kernel, expected_layout_shapes):
     name = SUNMMIO_TARGET_DESC
     target = tvm.target.Target(name)
 
     with tvm.target.Target(target):
         mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
         mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        dump_pipeline_test_log(case_name, "after_lower_and_legalize", mod)
         mod = tl.transform.IfStmtBinding()(mod)
-        print(mod)
+        dump_pipeline_test_log(case_name, "after_if_stmt_binding", mod)
         mod = tl.transform.SunmmioPipelinePlanningV2(debug=True)(mod)
+        dump_pipeline_test_log(case_name, "after_pipeline_planning_v2", mod)
         mod = tl.transform.InjectSunmmioPipeline()(mod)
-        mod.show()
+        dump_pipeline_test_log(case_name, "after_inject_sunmmio_pipeline", mod)
+        assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)

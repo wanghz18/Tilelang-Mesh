@@ -87,9 +87,9 @@ static bool IsImmediateScalar(const PrimExpr &expr) {
  * It does not implement global common-subexpression reuse. Any reuse policy is
  * applied later at stmt level in a deliberately conservative way.
  */
-class SunmmioExprAnalyzer : public StmtExprVisitor {
+class SunmmioExprAnalyzerV2 : public StmtExprVisitor {
 public:
-  SunmmioExprAnalyzer() {}
+  SunmmioExprAnalyzerV2() {}
 
   void Analyze(const PrimExpr &expr) {
     load_times = 0;
@@ -170,6 +170,36 @@ private:
   }
 
   void VisitExpr_(const LENode *op) final {
+    flops_ += VectorCoreCost::kCompareFlops;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const LTNode *op) final {
+    flops_ += VectorCoreCost::kCompareFlops;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const GENode *op) final {
+    flops_ += VectorCoreCost::kCompareFlops;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const GTNode *op) final {
+    flops_ += VectorCoreCost::kCompareFlops;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const EQNode *op) final {
+    flops_ += VectorCoreCost::kCompareFlops;
+    StmtExprVisitor::VisitExpr(op->a);
+    StmtExprVisitor::VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const NENode *op) final {
     flops_ += VectorCoreCost::kCompareFlops;
     StmtExprVisitor::VisitExpr(op->a);
     StmtExprVisitor::VisitExpr(op->b);
@@ -372,7 +402,7 @@ private:
    *   expression
    */
   VectorStmtFlopCost AnalyzeExpr(const PrimExpr &expr) {
-    SunmmioExprAnalyzer analyzer;
+    SunmmioExprAnalyzerV2 analyzer;
     analyzer.Analyze(expr);
 
     VectorStmtFlopCost cost;
