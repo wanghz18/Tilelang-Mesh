@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,17 @@ from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
+
+
+def _should_dump_pipeline_test_log():
+    """Return whether pipeline-stage IR should be dumped for this test run."""
+    return os.environ.get("TL_DUMP_SUNMMIO_PIPELINE_TEST_LOG", "0") in {
+        "1",
+        "true",
+        "True",
+        "on",
+        "ON",
+    }
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
@@ -131,8 +143,8 @@ def flashdecoding(batch=1, heads=256, groups=8, seqlen_kv=8192, dim=128, block_N
     shape_k = [batch, seqlen_kv, groups, dim]
     shape_v = [batch, seqlen_kv, groups, dim]
     shape_o = [batch, heads, dim]
-    dtype = T.float16
-    accum_dtype = T.float16
+    dtype = T.bfloat16
+    accum_dtype = T.bfloat16
     kv_group_num = heads // groups
 
     part_shape = [batch, heads, num_split, dim]
@@ -353,8 +365,8 @@ def flashmladecode(
     num_stages=1,
 ):
     scale = float(softmax_scale * 1.44269504)  # log2(e)
-    dtype = T.float16
-    accum_dtype = T.float16
+    dtype = T.bfloat16
+    accum_dtype = T.bfloat16
     kv_group_num = heads // kv_head_num
     VALID_BLOCK_H = min(block_H, kv_group_num)
     assert kv_head_num == 1, "kv_head_num must be 1"
@@ -523,111 +535,6 @@ def flashmladecode(
         return main_no_split
 
 
-def native_sparse_attention(
-    batch=2, heads=32, seq_len=64, dim=32, is_causal=True, scale=0.1, block_size=32, groups=32, selected_blocks=32, num_stages=3
-):
-    if scale is None:
-        scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        scale = scale * 1.44269504  # log2(e)
-
-    head_kv = heads // groups
-    q_shape = [batch, seq_len, heads, dim]
-    kv_shape = [batch, seq_len, head_kv, dim]
-    block_indices_shape = [batch, seq_len, head_kv, selected_blocks]
-    block_indices_dtype = T.int32
-    dtype = T.float16
-    accum_dtype = T.float16
-    block_S = block_size
-    block_T = min(128, tilelang.math.next_power_of_2(dim))
-
-    NK = tilelang.cdiv(dim, block_T)
-    NV = tilelang.cdiv(dim, block_T)
-    assert NK == 1, "The key dimension can not be larger than 256"
-
-    S = selected_blocks
-    G = groups
-    BS = block_S
-    BK = BV = block_T
-    threads = 32
-    print(G, BS, BK, BV)
-
-    @T.prim_func
-    def native_sparse_attention(
-        Q: T.Tensor(q_shape, dtype),
-        K: T.Tensor(kv_shape, dtype),
-        V: T.Tensor(kv_shape, dtype),
-        BlockIndices: T.Tensor(block_indices_shape, block_indices_dtype),
-        Output: T.Tensor(q_shape, dtype),
-    ):
-        with T.Kernel(seq_len, NV, batch * head_kv, threads=threads) as (bx, by, bz):
-            Q_shared = T.alloc_shared([G, BK], dtype)
-            K_shared = T.alloc_shared([BS, BK], dtype)
-            V_shared = T.alloc_shared([BS, BV], dtype)
-            O_shared = T.alloc_shared([G, BV], dtype)
-
-            acc_s = T.alloc_shared([G, BS], accum_dtype)
-            acc_s_cast = T.alloc_shared([G, BS], dtype)
-            acc_o = T.alloc_shared([G, BV], accum_dtype)
-            scores_max = T.alloc_shared([G], accum_dtype)
-            scores_max_prev = T.alloc_shared([G], accum_dtype)
-            scores_scale = T.alloc_shared([G], accum_dtype)
-            scores_sum = T.alloc_shared([G], accum_dtype)
-            logsum = T.alloc_shared([G], accum_dtype)
-
-            i_t, i_v, i_bh = bx, by, bz
-            i_b, i_h = i_bh // head_kv, i_bh % head_kv
-
-            NS = S
-            T.copy(Q[i_b, i_t, i_h * G : (i_h + 1) * G, :], Q_shared)
-
-            T.fill(acc_o, 0)
-            T.fill(logsum, 0)
-            T.fill(scores_max, -T.infinity(accum_dtype))
-
-            for i in T.Pipelined(NS, num_stages=num_stages):
-                i_s = BlockIndices[i_b, i_t, i_h, i] * BS
-                if i_s <= i_t and i_s >= 0:
-                    # [BS, BK]
-                    T.copy(K[i_b, i_s : i_s + BS, i_h, :], K_shared)
-
-                    if is_causal:
-                        for i, j in T.Tiles(acc_s, parallel=True):
-                            acc_s[i, j] = T.if_then_else(i_t >= (i_s + j), 0, -T.infinity(acc_s.dtype))
-                    else:
-                        T.clear(acc_s)
-
-                    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-
-                    # Softmax
-                    T.copy(scores_max, scores_max_prev)
-                    T.fill(scores_max, -T.infinity(accum_dtype))
-                    T.reduce_max(acc_s, scores_max, dim=1, clear=True)
-                    for i in T.Tiles(scores_scale, parallel=True):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                    for i, j in T.Tiles(acc_s, parallel=True):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                    T.reduce_sum(acc_s, scores_sum, dim=1)
-                    for i in T.Tiles(logsum, parallel=True):
-                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                    T.copy(acc_s, acc_s_cast)
-
-                    # Rescale
-                    for i, j in T.Tiles(acc_o, parallel=True):
-                        acc_o[i, j] *= scores_scale[i]
-
-                    # V * softmax(Q * K)
-                    T.copy(V[i_b, i_s : i_s + BS, i_h, i_v * BV : (i_v + 1) * BV], V_shared)
-                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
-            for i, j in T.Tiles(acc_o, parallel=True):
-                acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[i_b, i_t, i_h * G : (i_h + 1) * G, i_v * BV : (i_v + 1) * BV])
-
-    return native_sparse_attention
-
-
 CASES = [
     (
         "matmul",
@@ -636,7 +543,6 @@ CASES = [
             "A_rsram_stage": [3, 128, 32],
             "A_shared": [3, 128, 32],
             "B_shared": [3, 32, 128],
-            "C_shared": [128, 128],
         },
     ),
     (
@@ -649,9 +555,18 @@ CASES = [
             "V_shared": [3, 64, 128],
         },
     ),
-    # ("flashdecoding", lambda: flashdecoding(num_stages=3), {}),
-    # ("flashmladecode", lambda: flashmladecode(num_stages=5), {}),
-    # ("native_sparse_attention", lambda: native_sparse_attention(num_stages=5), {}),
+    (
+        "flashdecoding",
+        lambda: flashdecoding(num_stages=3),
+        {
+            "K_shared": [3, 128, 128],
+            "mask_local": [3, 128],
+            "acc_s": [3, 64, 128],
+            "acc_s_cast": [3, 64, 128],
+            "V_shared": [3, 128, 128],
+        },
+    ),
+    # ("flashmladecode", lambda: flashmladecode(num_stages=3), {}),
 ]
 
 
@@ -680,6 +595,8 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
 
 def dump_pipeline_test_log(case_name, stage, mod):
     """Dump the IRModule at a key pipeline stage for offline inspection."""
+    if not _should_dump_pipeline_test_log():
+        return
     log_dir = Path("pass_logs") / "sunmmio_pipeline_test"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{case_name}_{stage}.tir"
@@ -725,8 +642,8 @@ def test_tilelang_transform_sunmmio_pipeline(case_name, kernel, expected_layout_
         dump_pipeline_test_log(case_name, "after_lower_and_legalize", mod)
         mod = tl.transform.IfStmtBinding()(mod)
         dump_pipeline_test_log(case_name, "after_if_stmt_binding", mod)
-        mod = tl.transform.SunmmioPipelinePlanningV2(debug=True)(mod)
-        dump_pipeline_test_log(case_name, "after_pipeline_planning_v2", mod)
+        mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
+        dump_pipeline_test_log(case_name, "after_pipeline_planning", mod)
         mod = tl.transform.InjectSunmmioPipeline()(mod)
         dump_pipeline_test_log(case_name, "after_inject_sunmmio_pipeline", mod)
         assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)

@@ -156,6 +156,10 @@ private:
     if (op->op.same_as(Op::Get("tir.exp2"))) {
       flops_ += VectorCoreCost::kExp2Flops;
       StmtExprVisitor::VisitExpr(op->args[0]);
+    } else if (op->op.same_as(Op::Get("tir.if_then_else"))) {
+      StmtExprVisitor::VisitExpr(op->args[0]);
+      StmtExprVisitor::VisitExpr(op->args[1]);
+      StmtExprVisitor::VisitExpr(op->args[2]);
     } else if (op->op.same_as(Op::Get("tl.infinity"))) {
       PushUniqueExpr(
           &constants_,

@@ -190,7 +190,8 @@ private:
                                .as<Map<Buffer, Layout>>()
                                .value();
     }
-    // Begin a new workspace collection frame for this block scope
+    // Begin a new collection frame for this block scope.
+    alloc_buffer_stack_.emplace_back();
     workspace_stack_.emplace_back();
 
     auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
@@ -200,6 +201,12 @@ private:
       if (buffer_remap_.count(buffer)) {
         block_ptr->alloc_buffers.Set(i, buffer_remap_[buffer]);
       }
+    }
+    if (!alloc_buffer_stack_.empty()) {
+      for (const auto &buffer : alloc_buffer_stack_.back()) {
+        block_ptr->alloc_buffers.push_back(buffer);
+      }
+      alloc_buffer_stack_.pop_back();
     }
     // Attach any workspaces requested within this block to its alloc_buffers
     if (!workspace_stack_.empty()) {
@@ -927,6 +934,13 @@ private:
                                                     Layout layout) {
       layout_map_.Set(buffer, layout);
     };
+    AddAllocBufferCallback add_alloc_buffer = [this](Buffer buffer) {
+      if (!alloc_buffer_stack_.empty()) {
+        alloc_buffer_stack_.back().push_back(buffer);
+      } else {
+        alloc_buffer_stack_.emplace_back(Array<Buffer>{buffer});
+      }
+    };
 
     Range thread_bounds;
 
@@ -950,7 +964,7 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr,
+                  add_alloc_buffer, layout_map_, buffer_remap_, let_var_to_expr,
                   global_layout_map_, tileview_map_, register_layout},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
@@ -1165,6 +1179,8 @@ private:
   // calling PartitionLoop with the dummy v_thread would embed a free variable.
   bool has_thread_binding_ = false;
   size_t thread_block_size_ = 0;
+  // Stack of per-Block buffers introduced during tile-op lowering.
+  std::vector<Array<Buffer>> alloc_buffer_stack_;
   // Stack of per-Block workspace buffers gathered while visiting children
   std::vector<Array<Buffer>> workspace_stack_;
   // For ptx Node, we need to remap the buffer and indices
