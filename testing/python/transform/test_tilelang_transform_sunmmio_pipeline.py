@@ -1,6 +1,3 @@
-import os
-from pathlib import Path
-
 import pytest
 from tilelang import tvm as tvm
 import tilelang as tl
@@ -10,17 +7,6 @@ from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
-
-
-def _should_dump_pipeline_test_log():
-    """Return whether pipeline-stage IR should be dumped for this test run."""
-    return os.environ.get("TL_DUMP_SUNMMIO_PIPELINE_TEST_LOG", "0") in {
-        "1",
-        "true",
-        "True",
-        "on",
-        "ON",
-    }
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
@@ -580,7 +566,6 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tl.transform.InferSramScope()(mod)
     mod = tl.transform.LegalizeSunmmioDataPath()(mod)
     mod = tl.transform.SunmmioLayoutInference()(mod)
-    LayoutVisual(mod)
     mod = tl.transform.LowerTileOp()(mod)
     mod = tl.transform.LegalizeTilesLoop()(mod)
     mod = tl.transform.TilesLoop()(mod)
@@ -591,17 +576,6 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tl.transform.HoistNonRestrictParams()(mod)
     mod = tl.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
     return mod
-
-
-def dump_pipeline_test_log(case_name, stage, mod):
-    """Dump the IRModule at a key pipeline stage for offline inspection."""
-    if not _should_dump_pipeline_test_log():
-        return
-    log_dir = Path("pass_logs") / "sunmmio_pipeline_test"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{case_name}_{stage}.tir"
-    log_path.write_text(mod.script(), encoding="utf-8")
-    print(f"[sunmmio_pipeline_test] dumped {stage} to {log_path}")
 
 
 def _shape_to_int_list(shape):
@@ -639,11 +613,7 @@ def test_tilelang_transform_sunmmio_pipeline(case_name, kernel, expected_layout_
     with tvm.target.Target(target):
         mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
         mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
-        dump_pipeline_test_log(case_name, "after_lower_and_legalize", mod)
         mod = tl.transform.IfStmtBinding()(mod)
-        dump_pipeline_test_log(case_name, "after_if_stmt_binding", mod)
         mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
-        dump_pipeline_test_log(case_name, "after_pipeline_planning", mod)
         mod = tl.transform.InjectSunmmioPipeline()(mod)
-        dump_pipeline_test_log(case_name, "after_inject_sunmmio_pipeline", mod)
         assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)
