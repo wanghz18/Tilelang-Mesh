@@ -470,6 +470,7 @@ def flashmladecode(
             S_shared = T.alloc_shared([block_H, block_N], dtype)
             Q_pe_shared = T.alloc_shared([block_H, pe_dim], dtype)
             KV_shared = T.alloc_shared([block_N, dim], dtype)
+            KV_shared2 = T.alloc_shared([block_N, dim], dtype)
             K_pe_shared = T.alloc_shared([block_N, pe_dim], dtype)
             O_shared = T.alloc_shared([block_H, dim], dtype)
             acc_s = T.alloc_shared([block_H, block_N], accum_dtype)
@@ -491,6 +492,7 @@ def flashmladecode(
             loop_range = T.ceildiv(seqlen_kv, block_N)
             for k in T.Pipelined(loop_range, num_stages=num_stages):
                 T.copy(KV[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], KV_shared)
+                T.copy(KV[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], KV_shared2)
                 T.copy(K_pe[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], K_pe_shared)
                 T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True)
                 T.gemm(Q_pe_shared, K_pe_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
@@ -509,7 +511,7 @@ def flashmladecode(
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
                 for i, j in T.Tiles(acc_o, parallel=True):
                     acc_o[i, j] *= scores_scale[i]
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_shared2, acc_o, policy=T.GemmWarpPolicy.FullCol)
             for i, j in T.Tiles(acc_o, parallel=True):
                 acc_o[i, j] /= logsum[i]
             T.copy(acc_o, O_shared)
@@ -552,7 +554,15 @@ CASES = [
             "V_shared": [3, 128, 128],
         },
     ),
-    # ("flashmladecode", lambda: flashmladecode(num_stages=3), {}),
+    (
+        "flashmladecode",
+        lambda: flashmladecode(num_stages=3),
+        {
+            "KV_shared": [3, 64, 512],
+            "KV_shared2": [3, 64, 512],
+            "K_pe_shared": [3, 64, 64],
+        },
+    ),
 ]
 
 
