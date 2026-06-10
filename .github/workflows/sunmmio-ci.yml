@@ -7,6 +7,24 @@ on:
       - reopened
       - ready_for_review
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Run the full CI job or only the SunMMIO pipeline debug test"
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - debug_pipeline
+      pipeline_case:
+        description: "SunMMIO pipeline case used by debug_pipeline mode"
+        required: true
+        default: matmul
+        type: choice
+        options:
+          - matmul
+          - flashattn
+          - flashdecoding
 
 permissions:
   contents: read
@@ -29,6 +47,7 @@ env:
 jobs:
   lint:
     name: Quick Lint
+    if: github.event_name == 'pull_request' || inputs.run_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -63,7 +82,7 @@ jobs:
 
   test:
     name: CUDA Tests in Container (NVIDIA 3090)
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full')
     needs: [lint]
     runs-on: [self-hosted, Linux, CUDA-rtx3080]
     timeout-minutes: 120
@@ -403,3 +422,147 @@ jobs:
           uv cache prune 2>/dev/null || true
           echo "=== Cache usage after pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
+
+  debug-pipeline:
+    name: Debug SunMMIO Pipeline (${{ inputs.pipeline_case }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'debug_pipeline'
+    runs-on: [self-hosted, Linux, CUDA-rtx3080]
+    timeout-minutes: 120
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
+      options: --gpus all --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
+      volumes:
+        - /opt/ci-cache/sunmmio:/ci-cache
+    env:
+      USE_CUDA: 1
+      PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
+      UV_INDEX: https://download.pytorch.org/whl/cu128
+      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
+      XDG_CACHE_HOME: /ci-cache
+      PIP_CACHE_DIR: /ci-cache/pip
+      UV_CACHE_DIR: /ci-cache/uv
+      PRE_COMMIT_HOME: /ci-cache/pre-commit
+      GTEST_CACHE_DIR: /ci-cache/googletest
+      NPUIR_CACHE_ROOT: /ci-cache/npuir
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare persistent cache
+        run: |
+          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}" "${GTEST_CACHE_DIR}" "${NPUIR_CACHE_ROOT}"
+          echo "Cache mount: /ci-cache"
+          du -sh /ci-cache/* 2>/dev/null || echo "Cache is empty (first run)"
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3.12 python3.12-venv python3.12-dev python3-pip wget \
+            cmake ninja-build git curl ca-certificates \
+            build-essential pkg-config libprotobuf-dev \
+            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+            iproute2 iptables curl dnsutils openssh-client
+          ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+      - name: Fix container networking
+        run: |
+          set -euo pipefail
+          IFACE=$(ip route | awk '/default/{print $5; exit}')
+          MTU=1400
+          ip link set "${IFACE}" mtu "${MTU}" || \
+            echo "::warning::Failed to set MTU (may need --cap-add NET_ADMIN)"
+          iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+            echo "::warning::iptables MSS clamping failed (may need NET_ADMIN capability)"
+
+      - name: Install GoogleTest from source
+        run: |
+          cd "${GTEST_CACHE_DIR}"
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j$(nproc)
+          cmake --install build
+          cd ..
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          set-safe-directory: true
+
+      - name: Determine NPU-IR access mode
+        id: debug-npuir-mode
+        env:
+          HAS_PRIVATE_NPUIR_ACCESS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "${HAS_PRIVATE_NPUIR_ACCESS}" == "true" ]]; then
+            echo "available=1" >> "${GITHUB_OUTPUT}"
+            echo "TILELANG_NPUIR_CMAKE_ARGS=" >> "${GITHUB_ENV}"
+            echo "Running debug CI with private NPU-IR access."
+          else
+            echo "available=0" >> "${GITHUB_OUTPUT}"
+            echo "TILELANG_NPUIR_CMAKE_ARGS=-DUSE_NPUIR=OFF" >> "${GITHUB_ENV}"
+            echo "Running debug CI without private NPU-IR checkout."
+          fi
+
+      - name: Checkout public submodules
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git submodule sync --recursive
+          git -c protocol.version=2 submodule update --init --force --recursive \
+            3rdparty/composable_kernel \
+            3rdparty/cutlass \
+            3rdparty/tvm
+
+      - name: Resolve pinned NPU-IR commit
+        if: steps.debug-npuir-mode.outputs.available == '1'
+        id: debug-npuir-ref
+        run: |
+          set -euo pipefail
+          NPUIR_SHA="$(git ls-tree HEAD 3rdparty/NPU-IR | awk '{print $3}')"
+          if [[ -z "${NPUIR_SHA}" ]]; then
+            echo "::error::Could not determine the pinned NPU-IR commit from the superproject gitlink."
+            exit 1
+          fi
+          echo "sha=${NPUIR_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private NPU-IR submodule
+        if: steps.debug-npuir-mode.outputs.available == '1'
+        uses: actions/checkout@v6
+        with:
+          repository: SUNMMIO/NPU-IR
+          ref: ${{ steps.debug-npuir-ref.outputs.sha }}
+          path: 3rdparty/NPU-IR
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
+          fetch-depth: 1
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Setup Python environment
+        run: |
+          uv venv .venv --python /usr/bin/python3.12
+          uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel
+          uv pip install --python .venv/bin/python -v -r requirements-test.txt
+          echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
+          uv pip install --python .venv/bin/python --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
+          . .venv/bin/activate
+          python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda available: {torch.cuda.is_available()}'); print(f'device: {torch.cuda.get_device_name(0)}')"
+
+      - name: Install project (wheel form)
+        run: |
+          export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_NPUIR_CMAKE_ARGS}"
+          uv pip install -v .
+
+      - name: Run single SunMMIO pipeline test
+        run: |
+          . .venv/bin/activate
+          export PYTHONPATH="${GITHUB_WORKSPACE}/maint/scripts:${PYTHONPATH}"
+          cd testing
+          uv run --no-project -m -- pytest -c pytest.ini -n0 -s -vv --maxfail=1 \
+            "./python/transform/test_tilelang_transform_sunmmio_pipeline.py::test_tilelang_transform_sunmmio_pipeline[${{ inputs.pipeline_case }}]"
