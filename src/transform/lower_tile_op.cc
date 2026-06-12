@@ -190,8 +190,7 @@ private:
                                .as<Map<Buffer, Layout>>()
                                .value();
     }
-    // Begin a new collection frame for this block scope.
-    alloc_buffer_stack_.emplace_back();
+    // Begin a new workspace collection frame for this block scope
     workspace_stack_.emplace_back();
 
     auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
@@ -201,12 +200,6 @@ private:
       if (buffer_remap_.count(buffer)) {
         block_ptr->alloc_buffers.Set(i, buffer_remap_[buffer]);
       }
-    }
-    if (!alloc_buffer_stack_.empty()) {
-      for (const auto &buffer : alloc_buffer_stack_.back()) {
-        block_ptr->alloc_buffers.push_back(buffer);
-      }
-      alloc_buffer_stack_.pop_back();
     }
     // Attach any workspaces requested within this block to its alloc_buffers
     if (!workspace_stack_.empty()) {
@@ -1181,8 +1174,6 @@ private:
   // calling PartitionLoop with the dummy v_thread would embed a free variable.
   bool has_thread_binding_ = false;
   size_t thread_block_size_ = 0;
-  // Stack of per-Block buffers introduced during tile-op lowering.
-  std::vector<Array<Buffer>> alloc_buffer_stack_;
   // Stack of per-Block workspace buffers gathered while visiting children
   std::vector<Array<Buffer>> workspace_stack_;
   // For ptx Node, we need to remap the buffer and indices
