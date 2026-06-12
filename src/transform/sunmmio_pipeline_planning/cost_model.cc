@@ -4,6 +4,7 @@
  */
 
 #include "cost_model.h"
+#include "../../op/comm.h"
 #include "../../op/utils.h"
 
 #include <algorithm>
@@ -337,14 +338,18 @@ float CostModel::EstimateODMADelay(const tir::Stmt &stmt) {
     return ODMACost::kLayoutTransformStartupLatency +
            ceil_div(total_bytes, ODMACost::kLayoutTransformBytesPerCycle);
   } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
-    ICHECK(call->args[2].as<IntImmNode>())
-        << "ODMA broadcast size must be IntImm: " << stmt;
-    ICHECK(call->args[4].as<IntImmNode>())
+    ICHECK(call->args[kBroadcastArgDirection].as<IntImmNode>())
         << "ODMA broadcast direction must be IntImm: " << stmt;
 
-    BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
-    int broadcast_elements = call->args[2].as<IntImmNode>()->value;
-    int direction = call->args[4].as<IntImmNode>()->value;
+    BufferRegion src_region =
+        NormalizeToBufferRegion(call->args[kBroadcastArgSrc]);
+    int broadcast_elements = 1;
+    for (const Range &range : src_region->region) {
+      ICHECK(range->extent.as<IntImmNode>())
+          << "ODMA broadcast source extents must be IntImm: " << stmt;
+      broadcast_elements *= range->extent.as<IntImmNode>()->value;
+    }
+    int direction = call->args[kBroadcastArgDirection].as<IntImmNode>()->value;
     int bytes_per_element = ceil_div(src_region->buffer->dtype.bits() *
                                          src_region->buffer->dtype.lanes(),
                                      8);
