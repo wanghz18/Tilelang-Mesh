@@ -929,11 +929,10 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
       src_is_dram ? dma(src_region, stage_w) : xform(src_region, stage_w);
   Stmt leg_b =
       src_is_dram ? xform(stage_r, dst_region) : dma(stage_r, dst_region);
-
-  // Wrap in a Block so the staging buffer is allocated at this site.
-  Block stage_block({}, {}, {}, "sunmmio_layout_transform",
-                    SeqStmt({leg_a, leg_b}), std::nullopt, {stage}, {}, {});
-  return BlockRealize({}, Bool(true), stage_block);
+  ICHECK(T.AddAllocBuffer != nullptr)
+      << "sunmmio layout transform requires AddAllocBuffer callback.";
+  T.AddAllocBuffer(stage);
+  return SeqStmt({leg_a, leg_b});
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,

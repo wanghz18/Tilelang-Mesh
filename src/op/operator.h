@@ -24,6 +24,7 @@ namespace tl {
 using namespace tir;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
+using AddAllocBufferCallback = std::function<void(Buffer)>;
 // Callback for a tile op's Lower() to register the layout of a buffer it
 // introduced (e.g. a staging buffer), so later passes/codegen see it.
 using RegisterLayoutCallback = std::function<void(Buffer, Layout)>;
@@ -56,6 +57,7 @@ struct LowerArgs {
   Range thread_bounds;
   Var thread_var;
   AddWorkspaceCallback AddWorkspace;
+  AddAllocBufferCallback AddAllocBuffer;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
   // Map from LetStmt variable to its bound expression, for resolving

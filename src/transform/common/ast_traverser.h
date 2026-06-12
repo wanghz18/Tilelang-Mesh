@@ -2,7 +2,6 @@
 #define AST_TRAVERSER_H
 
 #include "../../op/builtin.h"
-#include "../../op/comm.h"
 #include "../../op/utils.h"
 #include "tvm/ir/expr.h"
 #include "tvm/runtime/logging.h"
@@ -71,27 +70,7 @@ private:
         const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
         reads_.push_back(buffer_region);
       }
-    }
-    // else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    //   ICHECK(args[0].as<BufferLoadNode>());
-    //   Buffer mbar_buf = args[0].as<BufferLoadNode>()->buffer;
-    //   auto buffer_reads =
-    //       chain_builder_.mbar_to_buffer_reads_.find(mbar_buf.get());
-    //   auto buffer_writes =
-    //       chain_builder_.mbar_to_buffer_writes_.find(mbar_buf.get());
-    //   if (buffer_reads != chain_builder_.mbar_to_buffer_reads_.end()) {
-    //     reads_.insert(reads_.end(), buffer_reads->second.begin(),
-    //                   buffer_reads->second.end());
-    //   }
-    //   if (buffer_writes != chain_builder_.mbar_to_buffer_writes_.end()) {
-    //     writes_.insert(
-    //         writes_.end(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).begin(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).end());
-    //   }
-    // }
-
-    else {
+    } else {
       ExprVisitor::VisitExpr_(op);
     }
   }
@@ -259,17 +238,18 @@ public:
     if (call->op.same_as(dma_copy())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    } else if (call->op.same_as(sunmmio_layout_transform())) {
+      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
+      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else if (call->op.same_as(mma_sunmmio())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-    } else if (call->op.same_as(broadcast_())) {
-      read_buffer_regions_.insert(
-          NormalizeToBufferRegion(call->args[kBroadcastArgSrc]));
-      write_buffer_regions_.insert(
-          NormalizeToBufferRegion(call->args[kBroadcastArgDst]));
+    } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
+      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {

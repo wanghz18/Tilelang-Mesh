@@ -1,3 +1,4 @@
+#include "../layout/cute_layout.h"
 #include "../layout/utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -11,6 +12,7 @@
 #include "common/remap_buffer_rewriter.h"
 #include "common/sunmmio_pipeline_utils.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/ir/attrs.h"
 #include "tvm/ir/expr.h"
 #include "tvm/node/cast.h"
 #include "tvm/node/structural_equal.h"
@@ -59,6 +61,8 @@ public:
           substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
     }
 
+    substituter.RewriteFunctionLayoutAttrs(f);
+
     f.CopyOnWrite()->body =
         RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
 
@@ -66,6 +70,32 @@ public:
   }
 
 private:
+  void RewriteFunctionLayoutAttrs(PrimFunc &f) {
+    auto layout_map_opt = f->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap);
+    if (!layout_map_opt) {
+      return;
+    }
+
+    arith::Analyzer analyzer;
+    Map<Buffer, Layout> new_layout_map;
+    for (const auto &[buffer, layout] : layout_map_opt.value()) {
+      auto it = buffer_remap_.find(buffer);
+      if (it == buffer_remap_.end()) {
+        new_layout_map.Set(buffer, layout);
+        continue;
+      }
+
+      const Buffer &new_buffer = (*it).second;
+      Optional<Layout> derived_layout = DeriveLayoutLike(
+          layout, new_buffer->shape, Optional<Array<Integer>>(), &analyzer);
+      ICHECK(derived_layout.defined())
+          << "Failed to derive multiversioned layout for buffer "
+          << buffer->name << " with shape " << new_buffer->shape;
+      new_layout_map.Set(new_buffer, derived_layout.value());
+    }
+    f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
+  }
+
   Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {
     const auto *ptr_type =
         TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
@@ -446,7 +476,7 @@ private:
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
 
     if (!iterations_anno || !used_buffers_anno || !versioned_buffers_anno ||
-        !prologue_orders_anno || !body_orders_anno || !epilogue_orders_anno) {
+        !prologue_orders_anno || !body_orders_anno) {
       return for_node;
     }
 
@@ -543,8 +573,10 @@ private:
         Downcast<Array<String>>(prologue_orders_anno.value());
     Array<String> body_orders =
         Downcast<Array<String>>(body_orders_anno.value());
-    Array<String> epilogue_orders =
-        Downcast<Array<String>>(epilogue_orders_anno.value());
+    Array<String> epilogue_orders;
+    if (epilogue_orders_anno) {
+      epilogue_orders = Downcast<Array<String>>(epilogue_orders_anno.value());
+    }
     Array<Buffer> versioned_buffers =
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
@@ -590,8 +622,6 @@ private:
     if (const auto *mod_int = epilogue_iterations_expr.as<IntImmNode>()) {
       epilogue_iterations = mod_int->value;
     }
-    ICHECK(epilogue_iterations != -1)
-        << "Can't calculate the epilogue iterations.";
 
     if (epilogue_iterations == 0) {
       extent = extent - 1;
@@ -602,15 +632,35 @@ private:
     for_body.push_back(new_for_stmt);
 
     // Step 3.3: Rewrite the epilogue.
-    for (const auto &order_str : epilogue_orders) {
-      int iter = name2iter(order_str);
-      int id = name2id(order_str);
-      Stmt stmt = pipeline_body_seq->seq[id];
-      rewriter.set_current_version(iter);
-      PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
-      rewriter.set_loop_var_replacement(replaced_loop_var);
-      stmt = rewriter(stmt);
-      for_body.push_back(stmt);
+    if (epilogue_iterations != -1) {
+      for (const auto &order_str : epilogue_orders) {
+        int iter = name2iter(order_str);
+        int id = name2id(order_str);
+        Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_version(iter);
+        PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
+        rewriter.set_loop_var_replacement(replaced_loop_var);
+        stmt = rewriter(stmt);
+        for_body.push_back(stmt);
+      }
+    } else {
+      // Dynamic epilogue loop for non-constant iterations
+      Var epilogue_loop_var("epilogue_i", for_node->loop_var->dtype);
+      Array<Stmt> epilogue_body;
+      for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
+        Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_version(
+            0); // Versioning is not deeply supported in dynamic epilogue yet
+        PrimExpr replaced_loop_var =
+            extent * iterations + epilogue_loop_var + for_node->min;
+        rewriter.set_loop_var_replacement(replaced_loop_var);
+        stmt = rewriter(stmt);
+        epilogue_body.push_back(stmt);
+      }
+      For dynamic_epilogue_for = For(
+          epilogue_loop_var, PrimExpr(0), epilogue_iterations_expr,
+          ForKind::kSerial, SeqStmt::Flatten(epilogue_body), std::nullopt, {});
+      for_body.push_back(dynamic_epilogue_for);
     }
     return SeqStmt::Flatten(for_body);
   }
@@ -623,8 +673,9 @@ private:
 tvm::transform::Pass InjectSunmmioPipeline() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    Stmt multiversioned_body = SunmmioMultiVersionBufferRewriter::Substitute(f);
     auto *fptr = f.CopyOnWrite();
-    fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(f);
+    fptr->body = multiversioned_body;
     fptr->body = SunmmioPipelineInjector::Inject(f);
     fptr->body = ConvertSSA(std::move(fptr->body));
     return f;
