@@ -943,13 +943,6 @@ private:
           << " called outside any block; the buffer would never be allocated.";
       workspace_stack_.back().push_back(buffer);
     };
-    AddAllocBufferCallback add_alloc_buffer = [this](Buffer buffer) {
-      if (!alloc_buffer_stack_.empty()) {
-        alloc_buffer_stack_.back().push_back(buffer);
-      } else {
-        alloc_buffer_stack_.emplace_back(Array<Buffer>{buffer});
-      }
-    };
 
     Range thread_bounds;
 
