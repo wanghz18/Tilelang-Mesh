@@ -270,6 +270,7 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/tileview/*.cc
   src/transform/*.cc
+  src/transform/sunmmio_pipeline_planning/*.cc
   src/transform/sunmmio_tile_loop_fusion/*.cc
   src/transform/common/*.cc
   src/op/*.cc
